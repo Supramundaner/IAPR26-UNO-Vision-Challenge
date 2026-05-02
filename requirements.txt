@@ -1,2 +1,7 @@
 kagglehub>=1.0.1
 kaggle>=2.1.0
+numpy>=1.26
+pandas>=2.0
+pillow>=10.0
+torch>=2.0
+torchvision>=0.15

@@ -106,3 +106,35 @@ Two baseline implementation families are mentioned in the competition descriptio
 - Deep learning pipeline: architecture, loss, and data processing choices, trained from scratch under the parameter limit.
 
 For either approach, the final notebook and presentation should include failure-case analysis and explain likely reasons for errors.
+
+## Current Baseline
+
+The implemented baseline follows [plan.md](plan.md):
+
+- `ConditionalCardCNN`: predicts cards from an image plus one conditional token: `center`, `top`, `right`, `bottom`, or `left`.
+- `ActivePlayerCNN`: separately predicts the active player as one of `p1`, `p2`, `p3`, `p4`.
+- Both models are trained from scratch and checked against the 12M parameter limit.
+
+Run model and data-flow checks:
+
+```powershell
+python scripts/smoke_test.py
+```
+
+Train the card model:
+
+```powershell
+python scripts/train_card_model.py --epochs 20 --batch-size 8 --image-size 384
+```
+
+Train the active-player model:
+
+```powershell
+python scripts/train_active_player.py --epochs 20 --batch-size 8 --image-size 384
+```
+
+Generate a submission after training:
+
+```powershell
+python scripts/generate_submission.py --output submissions/submission.csv
+```

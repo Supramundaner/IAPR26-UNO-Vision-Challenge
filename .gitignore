@@ -1,6 +1,8 @@
 # Local data and generated artifacts
 data/
 outputs/
+artifacts/
+submissions/
 models/
 checkpoints/
 runs/
