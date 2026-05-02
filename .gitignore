@@ -1,0 +1,29 @@
+# Local data and generated artifacts
+data/
+outputs/
+models/
+checkpoints/
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.venv/
+venv/
+env/
+
+# Kaggle credentials
+kaggle.json
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
