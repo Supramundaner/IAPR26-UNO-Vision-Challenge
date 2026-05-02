@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=384)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--empty-threshold", type=float, default=0.5)
+    parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--allow-random", action="store_true")
     return parser.parse_args()
 
@@ -60,7 +62,11 @@ def load_active_model(path: Path, device: torch.device, allow_random: bool):
 
 def main() -> None:
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print(f"Requested {args.device}, but CUDA is unavailable. Falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
     encoder = LabelEncoder.load(args.vocab)
     sample_df = pd.read_csv(args.sample_submission)
     image_ids = sample_df["image_id"].tolist()
@@ -84,15 +90,19 @@ def main() -> None:
             center_condition = torch.full(
                 (images.size(0),), CONDITION_TO_INDEX["center"], dtype=torch.long, device=device
             )
-            center_probs = torch.sigmoid(card_model(images, center_condition)).cpu()
+            center_logits, _ = card_model(images, center_condition)
+            center_probs = torch.sigmoid(center_logits).cpu()
 
             hand_probabilities = {}
+            empty_probabilities = {}
             for player in PLAYERS:
                 condition_name = PLAYER_TO_CONDITION[player]
                 condition = torch.full(
                     (images.size(0),), CONDITION_TO_INDEX[condition_name], dtype=torch.long, device=device
                 )
-                hand_probabilities[player] = torch.sigmoid(card_model(images, condition)).cpu()
+                hand_logits, empty_logits = card_model(images, condition)
+                hand_probabilities[player] = torch.sigmoid(hand_logits).cpu()
+                empty_probabilities[player] = torch.sigmoid(empty_logits).cpu()
 
             for row_index, image_id in enumerate(batch_image_ids):
                 output = {
@@ -101,9 +111,12 @@ def main() -> None:
                     "active_player": PLAYERS[active_indices[row_index]],
                 }
                 for player_number, player in enumerate(PLAYERS, start=1):
-                    output[f"player_{player_number}_cards"] = encoder.decode_hand(
-                        hand_probabilities[player][row_index], threshold=args.threshold
-                    )
+                    if float(empty_probabilities[player][row_index].item()) >= args.empty_threshold:
+                        output[f"player_{player_number}_cards"] = "EMPTY"
+                    else:
+                        output[f"player_{player_number}_cards"] = encoder.decode_hand(
+                            hand_probabilities[player][row_index], threshold=args.threshold
+                        )
                 predictions_by_id[image_id] = output
 
     fallback_center = encoder.cards[0]

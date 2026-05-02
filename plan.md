@@ -17,15 +17,15 @@ The final prediction pipeline has two separate neural components:
 1. Conditional card CNN
    - Input: one RGB image plus one conditional token.
    - Conditional token classes: `center`, `top`, `right`, `bottom`, `left`.
-   - Output: a multi-label vector over the UNO card vocabulary.
-   - Purpose: predict the center card or the set of cards held in a spatial player region.
+   - Output: a multi-label vector over the UNO card vocabulary plus an empty-hand confidence.
+   - Purpose: predict the center card or the set of cards held in a spatial player region, and detect empty hands for player regions.
 
 2. Active-player CNN
    - Input: one RGB image.
    - Output: one of `p1`, `p2`, `p3`, `p4`.
    - Purpose: detect the active-player token independently from card recognition.
 
-This split keeps the active-player problem clean and prevents the conditional card model from mixing two different output types.
+This split keeps the active-player problem clean while letting the conditional card model learn the closely related card-presence and empty-hand decisions.
 
 ## Label Design
 
@@ -39,7 +39,7 @@ The card vocabulary is inferred from `train.csv` by collecting every card string
 - `player_3_cards`
 - `player_4_cards`
 
-`EMPTY` is not a card class. It means that no card class should be active for that hand.
+`EMPTY` is not a card class. It is represented by a separate binary empty-hand target on player-hand conditional samples.
 
 Card examples include:
 
@@ -53,13 +53,13 @@ Card examples include:
 
 Each training image produces five card-training samples:
 
-| Conditional token | Target |
+| Conditional token | Card target | Empty target |
 | --- | --- |
-| `center` | one-hot center-card vector |
-| `top` | multi-hot vector for one player's cards |
-| `right` | multi-hot vector for one player's cards |
-| `bottom` | multi-hot vector for one player's cards |
-| `left` | multi-hot vector for one player's cards |
+| `center` | one-hot center-card vector | ignored |
+| `top` | multi-hot vector for one player's cards | 1 if that hand is `EMPTY`, else 0 |
+| `right` | multi-hot vector for one player's cards | 1 if that hand is `EMPTY`, else 0 |
+| `bottom` | multi-hot vector for one player's cards | 1 if that hand is `EMPTY`, else 0 |
+| `left` | multi-hot vector for one player's cards | 1 if that hand is `EMPTY`, else 0 |
 
 The implementation uses a fixed mapping from player IDs to spatial tokens:
 
@@ -97,24 +97,30 @@ The conditional CNN contains:
 2. a conditional-token embedding
 3. a small fusion MLP
 4. a sigmoid multi-label card head
+5. a sigmoid empty-hand head
 
 Conditioning is done by concatenating the pooled image feature with the learned token embedding. This is simple, parameter-efficient, and easy to inspect.
 
 Loss:
 
 ```text
-BCEWithLogitsLoss
+card BCEWithLogitsLoss + empty_loss_weight * masked empty BCEWithLogitsLoss
 ```
+
+The empty loss is masked out for the `center` token because the center-card prediction is never an empty-hand decision.
 
 Inference:
 
 - for `center`, choose the highest-probability card, because exactly one center card is expected
-- for player hands, choose all cards above a threshold
-- if no player-hand probability crosses the threshold, output `EMPTY`
+- for player hands, first use the empty-hand confidence
+- if empty confidence is above the empty threshold, output `EMPTY`
+- otherwise choose all cards above the card threshold
+- if the model predicts non-empty but no card crosses the card threshold, fall back to `EMPTY` as a valid CSV value
 
 Threshold selection:
 
 - default threshold: `0.5`
+- default empty threshold: `0.5`
 - later improvement: tune per-card or global threshold on a validation split using multiset F1
 
 ### Active-Player CNN
@@ -198,10 +204,8 @@ Player-card fields are semicolon-separated. Empty hands are written as `EMPTY`.
 ## Initial Implementation Tasks
 
 1. Build card vocabulary and label encoders from `train.csv`.
-2. Implement PyTorch datasets for:
-   - conditional card samples
-   - active-player samples
-3. Implement small CNN backbones and heads.
+2. Implement PyTorch datasets for conditional card/empty samples and active-player samples.
+3. Implement small CNN backbones and heads, including the conditional model's card and empty heads.
 4. Add scripts for:
    - parameter counting
    - card-model training

@@ -39,10 +39,11 @@ def main() -> None:
     batch = torch.randn(2, 3, args.image_size, args.image_size)
     conditions = torch.tensor([0, 1], dtype=torch.long)
     with torch.no_grad():
-        card_logits = card_model(batch, conditions)
+        card_logits, empty_logits = card_model(batch, conditions)
         active_logits = active_model(batch)
     print(f"Card logits shape: {tuple(card_logits.shape)}")
     print(f"Active logits shape: {tuple(active_logits.shape)}")
+    print(f"Empty logits shape: {tuple(empty_logits.shape)}")
 
 
 if __name__ == "__main__":

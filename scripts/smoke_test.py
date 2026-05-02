@@ -17,6 +17,8 @@ def main() -> None:
             "scripts/generate_submission.py",
             "--image-size",
             "128",
+            "--device",
+            "cpu",
             "--allow-random",
             "--output",
             "submissions/smoke_submission.csv",
@@ -26,4 +28,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

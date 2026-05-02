@@ -13,6 +13,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from uno_vision.config import ARTIFACT_DIR, PARAMETER_LIMIT, RAW_DATA_DIR
 from uno_vision.data import ActivePlayerDataset, train_val_image_ids
 from uno_vision.models import ActivePlayerCNN, count_parameters
+from uno_vision.training import add_common_training_args, maybe_init_wandb, maybe_log_wandb, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output", type=Path, default=ARTIFACT_DIR / "active_player_model.pt")
+    add_common_training_args(parser)
     return parser.parse_args()
 
 
@@ -53,7 +55,7 @@ def run_epoch(model, loader, criterion, optimizer, device: torch.device, train: 
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     train_ids, val_ids = train_val_image_ids(RAW_DATA_DIR / "train.csv", args.val_fraction, args.seed)
     train_dataset = ActivePlayerDataset(
         RAW_DATA_DIR / "train.csv",
@@ -74,12 +76,14 @@ def main() -> None:
 
     model = ActivePlayerCNN().to(device)
     params = count_parameters(model)
+    print(f"Device: {device}")
     print(f"ActivePlayerCNN parameters: {params:,}")
     if params >= PARAMETER_LIMIT:
         raise SystemExit(f"Model exceeds {PARAMETER_LIMIT:,} parameters")
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    run = maybe_init_wandb(args, "train-active-player", {**vars(args), "parameters": params})
     best_val = float("inf")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
@@ -89,10 +93,22 @@ def main() -> None:
             f"epoch={epoch:03d} train_loss={train_loss:.5f} train_acc={train_acc:.3f} "
             f"val_loss={val_loss:.5f} val_acc={val_acc:.3f}"
         )
+        maybe_log_wandb(
+            run,
+            {
+                "epoch": epoch,
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_acc,
+            },
+        )
         if val_loss < best_val:
             best_val = val_loss
             torch.save({"model_state": model.state_dict(), "image_size": args.image_size}, args.output)
             print(f"saved {args.output}")
+    if run is not None:
+        run.finish()
 
 
 if __name__ == "__main__":

@@ -55,6 +55,7 @@ class ConditionalCardSample:
     image_id: str
     condition: str
     target_column: str
+    is_center: bool
 
 
 class ConditionalCardDataset(Dataset):
@@ -79,13 +80,15 @@ class ConditionalCardDataset(Dataset):
         samples: list[ConditionalCardSample] = []
         for row in self.df.itertuples(index=False):
             image_id = str(row.image_id)
-            samples.append(ConditionalCardSample(image_id, "center", "center_card"))
+            samples.append(ConditionalCardSample(image_id, "center", "center_card", True))
             for player_index, player in enumerate(["p1", "p2", "p3", "p4"], start=1):
+                target_column = f"player_{player_index}_cards"
                 samples.append(
                     ConditionalCardSample(
                         image_id=image_id,
                         condition=PLAYER_TO_CONDITION[player],
-                        target_column=f"player_{player_index}_cards",
+                        target_column=target_column,
+                        is_center=False,
                     )
                 )
         return samples
@@ -99,7 +102,9 @@ class ConditionalCardDataset(Dataset):
         image = self.transform(read_image(self.image_dir / f"{sample.image_id}.jpg"))
         condition = torch.tensor(CONDITION_TO_INDEX[sample.condition], dtype=torch.long)
         target = torch.tensor(self.encoder.encode_cards(row[sample.target_column]), dtype=torch.float32)
-        return image, condition, target
+        empty_target = torch.tensor([1.0 if row[sample.target_column] == "EMPTY" else 0.0], dtype=torch.float32)
+        empty_mask = torch.tensor([0.0 if sample.is_center else 1.0], dtype=torch.float32)
+        return image, condition, target, empty_target, empty_mask
 
 
 class ActivePlayerDataset(Dataset):
@@ -140,4 +145,3 @@ class TestImageDataset(Dataset):
         image_id = self.image_ids[index]
         image = self.transform(read_image(self.image_dir / f"{image_id}.jpg"))
         return image_id, image
-

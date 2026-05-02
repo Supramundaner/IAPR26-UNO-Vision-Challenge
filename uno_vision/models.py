@@ -43,18 +43,20 @@ class ConditionalCardCNN(nn.Module):
         super().__init__()
         self.backbone = TinyBackbone()
         self.condition_embedding = nn.Embedding(num_conditions, condition_dim)
-        self.head = nn.Sequential(
+        self.fusion = nn.Sequential(
             nn.Linear(self.backbone.out_channels + condition_dim, 256),
             nn.SiLU(inplace=True),
             nn.Dropout(0.20),
-            nn.Linear(256, num_cards),
         )
+        self.card_head = nn.Linear(256, num_cards)
+        self.empty_head = nn.Linear(256, 1)
 
     def forward(self, image: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         image_features = self.backbone(image)
         condition_features = self.condition_embedding(condition)
         features = torch.cat([image_features, condition_features], dim=1)
-        return self.head(features)
+        fused = self.fusion(features)
+        return self.card_head(fused), self.empty_head(fused)
 
 
 class ActivePlayerCNN(nn.Module):
@@ -74,4 +76,3 @@ class ActivePlayerCNN(nn.Module):
 
 def count_parameters(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-
