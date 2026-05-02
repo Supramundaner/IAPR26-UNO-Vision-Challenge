@@ -124,7 +124,7 @@ python scripts/smoke_test.py
 Train the card model:
 
 ```powershell
-python scripts/train_card_model.py --epochs 20 --batch-size 8 --image-size 384
+python scripts/train_card_model.py --epochs 20 --batch-size 8 --image-size 512 --device cuda:0 --wandb --wandb-run-name card-empty-cnn-512-loss-balanced --num-workers 2 --output artifacts/card_model.pt
 ```
 
 Train the active-player model:

@@ -104,10 +104,18 @@ Conditioning is done by concatenating the pooled image feature with the learned 
 Loss:
 
 ```text
-card BCEWithLogitsLoss + empty_loss_weight * masked empty BCEWithLogitsLoss
+center_loss_weight * center CE + hand_loss_weight * non-empty hand BCE + empty_loss_weight * masked empty BCE
 ```
 
 The empty loss is masked out for the `center` token because the center-card prediction is never an empty-hand decision.
+The hand-card BCE is masked out for `EMPTY` hands so empty examples do not teach the card head to suppress every class.
+Default weights are chosen to keep loss terms on a similar scale and to emphasize the leaderboard's card-F1 component:
+
+```text
+center_loss_weight = 0.1
+hand_loss_weight = 2.0
+empty_loss_weight = 0.5
+```
 
 Inference:
 
