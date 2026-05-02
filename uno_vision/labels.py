@@ -46,6 +46,12 @@ class LabelEncoder:
             vector[mapping[card]] = 1.0
         return vector
 
+    def encode_center(self, value: str) -> int:
+        cards = split_cards(value)
+        if len(cards) != 1:
+            raise ValueError(f"Expected exactly one center card, got {value!r}")
+        return self.card_to_index[cards[0]]
+
     def decode_hand(self, probabilities, threshold: float = 0.5) -> str:
         selected = [card for card, prob in zip(self.cards, probabilities) if float(prob) >= threshold]
         return ";".join(selected) if selected else "EMPTY"
@@ -70,4 +76,3 @@ def load_or_create_encoder(train_csv: Path, output_path: Path) -> LabelEncoder:
     encoder = LabelEncoder(build_card_vocabulary(train_csv))
     encoder.save(output_path)
     return encoder
-

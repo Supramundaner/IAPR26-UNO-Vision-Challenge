@@ -25,8 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", default="384", help="Square resize size, or 'original'")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--center-loss-weight", type=float, default=1.0)
+    parser.add_argument("--hand-loss-weight", type=float, default=1.0)
     parser.add_argument("--empty-loss-weight", type=float, default=0.25)
-    parser.add_argument("--max-pos-weight", type=float, default=50.0)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -38,47 +39,63 @@ def parse_args() -> argparse.Namespace:
 def run_epoch(
     model,
     loader,
-    card_criterion,
+    center_criterion,
+    hand_criterion,
     empty_criterion,
     optimizer,
     device: torch.device,
     train: bool,
+    center_loss_weight: float,
+    hand_loss_weight: float,
     empty_loss_weight: float,
     desc: str,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     model.train(train)
     total_loss = 0.0
-    total_card_loss = 0.0
+    total_center_loss = 0.0
+    total_hand_loss = 0.0
     total_empty_loss = 0.0
     total_count = 0
     progress = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
-    for images, conditions, card_targets, empty_targets, empty_masks in progress:
+    for images, conditions, card_targets, center_targets, empty_targets, center_masks, hand_card_masks, empty_masks in progress:
         images = images.to(device)
         conditions = conditions.to(device)
         card_targets = card_targets.to(device)
+        center_targets = center_targets.to(device)
         empty_targets = empty_targets.to(device)
+        center_masks = center_masks.to(device)
+        hand_card_masks = hand_card_masks.to(device)
         empty_masks = empty_masks.to(device)
         with torch.set_grad_enabled(train):
             card_logits, empty_logits = model(images, conditions)
-            card_loss = card_criterion(card_logits, card_targets)
+            raw_center_loss = center_criterion(card_logits, center_targets)
+            center_loss = (raw_center_loss * center_masks.flatten()).sum() / center_masks.sum().clamp_min(1.0)
+            raw_hand_loss = hand_criterion(card_logits, card_targets).mean(dim=1, keepdim=True)
+            hand_loss = (raw_hand_loss * hand_card_masks).sum() / hand_card_masks.sum().clamp_min(1.0)
             raw_empty_loss = empty_criterion(empty_logits, empty_targets)
             empty_loss = (raw_empty_loss * empty_masks).sum() / empty_masks.sum().clamp_min(1.0)
-            loss = card_loss + empty_loss_weight * empty_loss
+            loss = (
+                center_loss_weight * center_loss
+                + hand_loss_weight * hand_loss
+                + empty_loss_weight * empty_loss
+            )
             if train:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
         total_loss += float(loss.item()) * images.size(0)
-        total_card_loss += float(card_loss.item()) * images.size(0)
+        total_center_loss += float(center_loss.item()) * images.size(0)
+        total_hand_loss += float(hand_loss.item()) * images.size(0)
         total_empty_loss += float(empty_loss.item()) * images.size(0)
         total_count += images.size(0)
         progress.set_postfix(
             loss=f"{float(loss.item()):.4f}",
-            card=f"{float(card_loss.item()):.4f}",
+            center=f"{float(center_loss.item()):.4f}",
+            hand=f"{float(hand_loss.item()):.4f}",
             empty=f"{float(empty_loss.item()):.4f}",
         )
     denominator = max(1, total_count)
-    return total_loss / denominator, total_card_loss / denominator, total_empty_loss / denominator
+    return total_loss / denominator, total_center_loss / denominator, total_hand_loss / denominator, total_empty_loss / denominator
 
 
 def main() -> None:
@@ -114,22 +131,9 @@ def main() -> None:
     if params >= PARAMETER_LIMIT:
         raise SystemExit(f"Model exceeds {PARAMETER_LIMIT:,} parameters")
 
-    card_positive, card_total, empty_stats = train_dataset.label_statistics()
-    card_negative = card_total - card_positive
-    card_pos_weight = (card_negative / card_positive.clamp_min(1.0)).clamp(max=args.max_pos_weight).to(device)
-    empty_positive, empty_total = empty_stats[0], empty_stats[1]
-    empty_negative = empty_total - empty_positive
-    empty_pos_weight = (empty_negative / empty_positive.clamp_min(1.0)).clamp(max=args.max_pos_weight).to(device)
-    print(
-        "Card pos_weight: "
-        f"min={float(card_pos_weight.min().item()):.2f} "
-        f"mean={float(card_pos_weight.mean().item()):.2f} "
-        f"max={float(card_pos_weight.max().item()):.2f}"
-    )
-    print(f"Empty pos_weight: {float(empty_pos_weight.item()):.2f}")
-
-    card_criterion = nn.BCEWithLogitsLoss(pos_weight=card_pos_weight)
-    empty_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=empty_pos_weight)
+    center_criterion = nn.CrossEntropyLoss(reduction="none")
+    hand_criterion = nn.BCEWithLogitsLoss(reduction="none")
+    empty_criterion = nn.BCEWithLogitsLoss(reduction="none")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     run = maybe_init_wandb(
         args,
@@ -138,52 +142,57 @@ def main() -> None:
             **vars(args),
             "parameters": params,
             "num_cards": len(encoder.cards),
-            "card_pos_weight_min": float(card_pos_weight.min().item()),
-            "card_pos_weight_mean": float(card_pos_weight.mean().item()),
-            "card_pos_weight_max": float(card_pos_weight.max().item()),
-            "empty_pos_weight": float(empty_pos_weight.item()),
         },
     )
 
     best_val = float("inf")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_card_loss, train_empty_loss = run_epoch(
+        train_loss, train_center_loss, train_hand_loss, train_empty_loss = run_epoch(
             model,
             train_loader,
-            card_criterion,
+            center_criterion,
+            hand_criterion,
             empty_criterion,
             optimizer,
             device,
             True,
+            args.center_loss_weight,
+            args.hand_loss_weight,
             args.empty_loss_weight,
             f"epoch {epoch:03d}/{args.epochs} train",
         )
-        val_loss, val_card_loss, val_empty_loss = run_epoch(
+        val_loss, val_center_loss, val_hand_loss, val_empty_loss = run_epoch(
             model,
             val_loader,
-            card_criterion,
+            center_criterion,
+            hand_criterion,
             empty_criterion,
             optimizer,
             device,
             False,
+            args.center_loss_weight,
+            args.hand_loss_weight,
             args.empty_loss_weight,
             f"epoch {epoch:03d}/{args.epochs} val",
         )
         print(
-            f"epoch={epoch:03d} train_loss={train_loss:.5f} train_card={train_card_loss:.5f} "
+            f"epoch={epoch:03d} train_loss={train_loss:.5f} train_center={train_center_loss:.5f} "
+            f"train_hand={train_hand_loss:.5f} "
             f"train_empty={train_empty_loss:.5f} val_loss={val_loss:.5f} "
-            f"val_card={val_card_loss:.5f} val_empty={val_empty_loss:.5f}"
+            f"val_center={val_center_loss:.5f} val_hand={val_hand_loss:.5f} val_empty={val_empty_loss:.5f}"
         )
         maybe_log_wandb(
             run,
             {
                 "epoch": epoch,
                 "train/loss": train_loss,
-                "train/card_loss": train_card_loss,
+                "train/center_loss": train_center_loss,
+                "train/hand_loss": train_hand_loss,
                 "train/empty_loss": train_empty_loss,
                 "val/loss": val_loss,
-                "val/card_loss": val_card_loss,
+                "val/center_loss": val_center_loss,
+                "val/hand_loss": val_hand_loss,
                 "val/empty_loss": val_empty_loss,
             },
         )

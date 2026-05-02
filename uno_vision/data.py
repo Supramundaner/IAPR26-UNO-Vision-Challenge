@@ -130,9 +130,12 @@ class ConditionalCardDataset(Dataset):
         image = self.transform(read_image(self.image_dir / f"{sample.image_id}.jpg"))
         condition = torch.tensor(CONDITION_TO_INDEX[sample.condition], dtype=torch.long)
         target = torch.tensor(self.encoder.encode_cards(row[sample.target_column]), dtype=torch.float32)
+        center_target = torch.tensor(self.encoder.encode_center(row[sample.target_column]) if sample.is_center else 0, dtype=torch.long)
         empty_target = torch.tensor([1.0 if row[sample.target_column] == "EMPTY" else 0.0], dtype=torch.float32)
+        center_mask = torch.tensor([1.0 if sample.is_center else 0.0], dtype=torch.float32)
+        hand_card_mask = torch.tensor([0.0 if sample.is_center or row[sample.target_column] == "EMPTY" else 1.0], dtype=torch.float32)
         empty_mask = torch.tensor([0.0 if sample.is_center else 1.0], dtype=torch.float32)
-        return image, condition, target, empty_target, empty_mask
+        return image, condition, target, center_target, empty_target, center_mask, hand_card_mask, empty_mask
 
 
 class ActivePlayerDataset(Dataset):
