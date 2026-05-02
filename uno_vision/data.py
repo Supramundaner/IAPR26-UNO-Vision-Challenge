@@ -109,6 +109,21 @@ class ConditionalCardDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def label_statistics(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        card_positive = torch.zeros(len(self.encoder.cards), dtype=torch.float32)
+        card_total = 0
+        empty_positive = torch.zeros(1, dtype=torch.float32)
+        empty_total = torch.zeros(1, dtype=torch.float32)
+        for sample in self.samples:
+            row = self.df[self.df["image_id"] == sample.image_id].iloc[0]
+            card_positive += torch.tensor(self.encoder.encode_cards(row[sample.target_column]), dtype=torch.float32)
+            card_total += 1
+            if not sample.is_center:
+                empty_positive += 1.0 if row[sample.target_column] == "EMPTY" else 0.0
+                empty_total += 1.0
+        card_total_tensor = torch.full_like(card_positive, float(card_total))
+        return card_positive, card_total_tensor, torch.cat([empty_positive, empty_total])
+
     def __getitem__(self, index: int):
         sample = self.samples[index]
         row = self.df[self.df["image_id"] == sample.image_id].iloc[0]

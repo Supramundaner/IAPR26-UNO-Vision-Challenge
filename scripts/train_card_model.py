@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--empty-loss-weight", type=float, default=0.25)
+    parser.add_argument("--max-pos-weight", type=float, default=50.0)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -113,10 +114,36 @@ def main() -> None:
     if params >= PARAMETER_LIMIT:
         raise SystemExit(f"Model exceeds {PARAMETER_LIMIT:,} parameters")
 
-    card_criterion = nn.BCEWithLogitsLoss()
-    empty_criterion = nn.BCEWithLogitsLoss(reduction="none")
+    card_positive, card_total, empty_stats = train_dataset.label_statistics()
+    card_negative = card_total - card_positive
+    card_pos_weight = (card_negative / card_positive.clamp_min(1.0)).clamp(max=args.max_pos_weight).to(device)
+    empty_positive, empty_total = empty_stats[0], empty_stats[1]
+    empty_negative = empty_total - empty_positive
+    empty_pos_weight = (empty_negative / empty_positive.clamp_min(1.0)).clamp(max=args.max_pos_weight).to(device)
+    print(
+        "Card pos_weight: "
+        f"min={float(card_pos_weight.min().item()):.2f} "
+        f"mean={float(card_pos_weight.mean().item()):.2f} "
+        f"max={float(card_pos_weight.max().item()):.2f}"
+    )
+    print(f"Empty pos_weight: {float(empty_pos_weight.item()):.2f}")
+
+    card_criterion = nn.BCEWithLogitsLoss(pos_weight=card_pos_weight)
+    empty_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=empty_pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    run = maybe_init_wandb(args, "train-card-model", {**vars(args), "parameters": params, "num_cards": len(encoder.cards)})
+    run = maybe_init_wandb(
+        args,
+        "train-card-model",
+        {
+            **vars(args),
+            "parameters": params,
+            "num_cards": len(encoder.cards),
+            "card_pos_weight_min": float(card_pos_weight.min().item()),
+            "card_pos_weight_mean": float(card_pos_weight.mean().item()),
+            "card_pos_weight_max": float(card_pos_weight.max().item()),
+            "empty_pos_weight": float(empty_pos_weight.item()),
+        },
+    )
 
     best_val = float("inf")
     args.output.parent.mkdir(parents=True, exist_ok=True)
