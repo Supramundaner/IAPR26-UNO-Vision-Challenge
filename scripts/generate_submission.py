@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--empty-threshold", type=float, default=0.5)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--crop-by-token", action="store_true", help="Use token-specific ROI crops for card inference")
     parser.add_argument("--allow-random", action="store_true")
     return parser.parse_args()
 
@@ -74,50 +75,88 @@ def main() -> None:
     missing_image_ids = [image_id for image_id in image_ids if image_id not in set(existing_image_ids)]
     if missing_image_ids:
         print(f"Warning: {len(missing_image_ids)} sample rows have no image file: {missing_image_ids}")
-    dataset = TestImageDataset(args.image_dir, existing_image_ids, image_size=args.image_size)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
-
     card_model = load_card_model(args.card_model, len(encoder.cards), device, args.allow_random)
     active_model = load_active_model(args.active_model, device, args.allow_random)
 
-    predictions_by_id = {}
+    predictions_by_id = {
+        image_id: {
+            "image_id": image_id,
+            "center_card": encoder.cards[0],
+            "active_player": "p1",
+            "player_1_cards": "EMPTY",
+            "player_2_cards": "EMPTY",
+            "player_3_cards": "EMPTY",
+            "player_4_cards": "EMPTY",
+        }
+        for image_id in existing_image_ids
+    }
     with torch.no_grad():
-        for batch_image_ids, images in loader:
+        active_loader = DataLoader(
+            TestImageDataset(args.image_dir, existing_image_ids, image_size=args.image_size),
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
+        for batch_image_ids, images in active_loader:
             images = images.to(device)
             active_logits = active_model(images)
             active_indices = active_logits.argmax(dim=1).cpu().tolist()
+            for row_index, image_id in enumerate(batch_image_ids):
+                predictions_by_id[image_id]["active_player"] = PLAYERS[active_indices[row_index]]
 
+        center_loader = DataLoader(
+            TestImageDataset(
+                args.image_dir,
+                existing_image_ids,
+                image_size=args.image_size,
+                condition="center" if args.crop_by_token else None,
+            ),
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
+        for batch_image_ids, images in center_loader:
+            images = images.to(device)
             center_condition = torch.full(
                 (images.size(0),), CONDITION_TO_INDEX["center"], dtype=torch.long, device=device
             )
             center_logits, _ = card_model(images, center_condition)
             center_probs = torch.sigmoid(center_logits).cpu()
+            for row_index, image_id in enumerate(batch_image_ids):
+                predictions_by_id[image_id]["center_card"] = encoder.decode_center(center_probs[row_index])
 
-            hand_probabilities = {}
-            empty_probabilities = {}
-            for player in PLAYERS:
-                condition_name = PLAYER_TO_CONDITION[player]
+        hand_probabilities = {}
+        empty_probabilities = {}
+        for player in PLAYERS:
+            condition_name = PLAYER_TO_CONDITION[player]
+            condition_loader = DataLoader(
+                TestImageDataset(
+                    args.image_dir,
+                    existing_image_ids,
+                    image_size=args.image_size,
+                    condition=condition_name if args.crop_by_token else None,
+                ),
+                batch_size=args.batch_size,
+                shuffle=False,
+            )
+            for batch_image_ids, images in condition_loader:
+                images = images.to(device)
                 condition = torch.full(
                     (images.size(0),), CONDITION_TO_INDEX[condition_name], dtype=torch.long, device=device
                 )
                 hand_logits, empty_logits = card_model(images, condition)
-                hand_probabilities[player] = torch.sigmoid(hand_logits).cpu()
-                empty_probabilities[player] = torch.sigmoid(empty_logits).cpu()
+                hand_probs = torch.sigmoid(hand_logits).cpu()
+                empty_probs = torch.sigmoid(empty_logits).cpu()
+                for row_index, image_id in enumerate(batch_image_ids):
+                    hand_probabilities[(image_id, player)] = hand_probs[row_index]
+                    empty_probabilities[(image_id, player)] = empty_probs[row_index]
 
-            for row_index, image_id in enumerate(batch_image_ids):
-                output = {
-                    "image_id": image_id,
-                    "center_card": encoder.decode_center(center_probs[row_index]),
-                    "active_player": PLAYERS[active_indices[row_index]],
-                }
-                for player_number, player in enumerate(PLAYERS, start=1):
-                    if float(empty_probabilities[player][row_index].item()) >= args.empty_threshold:
-                        output[f"player_{player_number}_cards"] = "EMPTY"
-                    else:
-                        output[f"player_{player_number}_cards"] = encoder.decode_hand(
-                            hand_probabilities[player][row_index], threshold=args.threshold
-                        )
-                predictions_by_id[image_id] = output
+        for image_id in existing_image_ids:
+            for player_number, player in enumerate(PLAYERS, start=1):
+                if float(empty_probabilities[(image_id, player)].item()) >= args.empty_threshold:
+                    predictions_by_id[image_id][f"player_{player_number}_cards"] = "EMPTY"
+                else:
+                    predictions_by_id[image_id][f"player_{player_number}_cards"] = encoder.decode_hand(
+                        hand_probabilities[(image_id, player)], threshold=args.threshold
+                    )
 
     fallback_center = encoder.cards[0]
     for image_id in missing_image_ids:

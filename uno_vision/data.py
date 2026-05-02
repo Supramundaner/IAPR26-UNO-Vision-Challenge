@@ -16,6 +16,14 @@ from uno_vision.labels import LabelEncoder
 
 ImageSize = int | str
 
+CONDITION_CROP_BOXES = {
+    "center": (0.32, 0.24, 0.68, 0.76),
+    "top": (0.00, 0.00, 1.00, 0.48),
+    "right": (0.45, 0.00, 1.00, 1.00),
+    "bottom": (0.00, 0.52, 1.00, 1.00),
+    "left": (0.00, 0.00, 0.55, 1.00),
+}
+
 
 def normalize_image_size(image_size: ImageSize) -> int | None:
     if isinstance(image_size, str):
@@ -52,6 +60,18 @@ def read_image(path: Path) -> Image.Image:
         return image.convert("RGB")
 
 
+def crop_by_condition(image: Image.Image, condition: str) -> Image.Image:
+    left, top, right, bottom = CONDITION_CROP_BOXES[condition]
+    width, height = image.size
+    box = (
+        int(round(left * width)),
+        int(round(top * height)),
+        int(round(right * width)),
+        int(round(bottom * height)),
+    )
+    return image.crop(box)
+
+
 def train_val_image_ids(train_csv: Path, val_fraction: float, seed: int) -> tuple[set[str], set[str]]:
     df = pd.read_csv(train_csv)
     image_ids = sorted(df["image_id"].tolist())
@@ -80,13 +100,17 @@ class ConditionalCardDataset(Dataset):
         image_ids: set[str] | None = None,
         image_size: ImageSize = 384,
         train: bool = True,
+        crop_by_token: bool = True,
     ) -> None:
+        if crop_by_token and normalize_image_size(image_size) is None:
+            raise ValueError("ConditionalCardDataset requires a resized image_size when crop_by_token=True")
         self.df = pd.read_csv(train_csv)
         if image_ids is not None:
             self.df = self.df[self.df["image_id"].isin(image_ids)].reset_index(drop=True)
         self.image_dir = image_dir
         self.encoder = encoder
         self.transform = image_transform(image_size, train=train)
+        self.crop_by_token = crop_by_token
         self.samples = self._build_samples()
 
     def _build_samples(self) -> list[ConditionalCardSample]:
@@ -127,7 +151,10 @@ class ConditionalCardDataset(Dataset):
     def __getitem__(self, index: int):
         sample = self.samples[index]
         row = self.df[self.df["image_id"] == sample.image_id].iloc[0]
-        image = self.transform(read_image(self.image_dir / f"{sample.image_id}.jpg"))
+        image = read_image(self.image_dir / f"{sample.image_id}.jpg")
+        if self.crop_by_token:
+            image = crop_by_condition(image, sample.condition)
+        image = self.transform(image)
         condition = torch.tensor(CONDITION_TO_INDEX[sample.condition], dtype=torch.long)
         target = torch.tensor(self.encoder.encode_cards(row[sample.target_column]), dtype=torch.float32)
         center_target = torch.tensor(self.encoder.encode_center(row[sample.target_column]) if sample.is_center else 0, dtype=torch.long)
@@ -164,9 +191,18 @@ class ActivePlayerDataset(Dataset):
 
 
 class TestImageDataset(Dataset):
-    def __init__(self, image_dir: Path, image_ids: list[str], image_size: ImageSize = 384) -> None:
+    def __init__(
+        self,
+        image_dir: Path,
+        image_ids: list[str],
+        image_size: ImageSize = 384,
+        condition: str | None = None,
+    ) -> None:
+        if condition is not None and normalize_image_size(image_size) is None:
+            raise ValueError("Condition-cropped test images require a resized image_size")
         self.image_dir = image_dir
         self.image_ids = image_ids
+        self.condition = condition
         self.transform = image_transform(image_size, train=False)
 
     def __len__(self) -> int:
@@ -174,5 +210,8 @@ class TestImageDataset(Dataset):
 
     def __getitem__(self, index: int):
         image_id = self.image_ids[index]
-        image = self.transform(read_image(self.image_dir / f"{image_id}.jpg"))
+        image = read_image(self.image_dir / f"{image_id}.jpg")
+        if self.condition is not None:
+            image = crop_by_condition(image, self.condition)
+        image = self.transform(image)
         return image_id, image

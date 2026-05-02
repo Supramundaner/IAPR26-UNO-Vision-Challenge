@@ -99,16 +99,17 @@ The conditional CNN contains:
 4. a sigmoid multi-label card head
 5. a sigmoid empty-hand head
 
-Conditioning is done by concatenating the pooled image feature with the learned token embedding. This is simple, parameter-efficient, and easy to inspect.
+Conditioning is done by concatenating the pooled full-image feature with the learned token embedding. A token-specific ROI crop utility is available for diagnostics and optional experiments, but the default training pipeline uses the full image to avoid hand-tuned crop boxes cutting off cards or introducing layout bias.
 
 Loss:
 
 ```text
-center_loss_weight * center CE + hand_loss_weight * non-empty hand BCE + empty_loss_weight * masked empty BCE
+center_loss_weight * center CE + hand_loss_weight * non-empty hand ASL + empty_loss_weight * masked empty BCE
 ```
 
 The empty loss is masked out for the `center` token because the center-card prediction is never an empty-hand decision.
 The hand-card BCE is masked out for `EMPTY` hands so empty examples do not teach the card head to suppress every class.
+The hand-card term uses asymmetric multi-label loss by default, which down-weights easy negative labels so sparse positive card labels are not overwhelmed.
 Default weights are chosen to keep loss terms on a similar scale and to emphasize the leaderboard's card-F1 component:
 
 ```text

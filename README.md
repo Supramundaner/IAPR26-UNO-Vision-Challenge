@@ -111,7 +111,7 @@ For either approach, the final notebook and presentation should include failure-
 
 The implemented baseline follows [plan.md](plan.md):
 
-- `ConditionalCardCNN`: predicts cards and an empty-hand confidence from an image plus one conditional token: `center`, `top`, `right`, `bottom`, or `left`. `EMPTY` is not a card class.
+- `ConditionalCardCNN`: predicts cards and an empty-hand confidence from the full image plus one conditional token (`center`, `top`, `right`, `bottom`, or `left`). `EMPTY` is not a card class.
 - `ActivePlayerCNN`: separately predicts the active player as one of `p1`, `p2`, `p3`, `p4`.
 - Both models are trained from scratch and checked against the 12M parameter limit.
 
