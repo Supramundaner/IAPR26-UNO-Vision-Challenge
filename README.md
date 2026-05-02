@@ -30,13 +30,15 @@ python scripts/download_data.py
 
 The script downloads the competition files through KaggleHub into `data/raw/` and copies the expected competition files there.
 
-Kaggle competitions normally require authentication and accepting the competition rules before downloads are allowed. If download fails, create a Kaggle API token at Kaggle account settings and place it at:
+Kaggle competitions normally require authentication and accepting the competition rules before downloads are allowed. Do not commit Kaggle tokens to this repository.
+
+If download fails, create a Kaggle API token from Kaggle account settings and save it outside the repository at:
 
 ```text
-C:\Users\<your-user>\.kaggle\kaggle.json
+C:\Users\<your-user>\.kaggle\access_token
 ```
 
-Then accept the rules on the competition page and rerun the script.
+The file should contain only the token value. Then accept the rules on the competition page and rerun the script.
 
 ## Rules and Constraints
 
