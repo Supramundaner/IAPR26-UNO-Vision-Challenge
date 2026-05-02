@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -20,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--image-size", type=int, default=384)
+    parser.add_argument("--image-size", default="384", help="Square resize size, or 'original'")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--val-fraction", type=float, default=0.2)
@@ -31,12 +32,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_epoch(model, loader, criterion, optimizer, device: torch.device, train: bool) -> tuple[float, float]:
+def run_epoch(model, loader, criterion, optimizer, device: torch.device, train: bool, desc: str) -> tuple[float, float]:
     model.train(train)
     total_loss = 0.0
     total_correct = 0
     total_count = 0
-    for images, targets in loader:
+    progress = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    for images, targets in progress:
         images = images.to(device)
         targets = targets.to(device)
         with torch.set_grad_enabled(train):
@@ -49,6 +51,8 @@ def run_epoch(model, loader, criterion, optimizer, device: torch.device, train: 
         total_loss += float(loss.item()) * images.size(0)
         total_correct += int((logits.argmax(dim=1) == targets).sum().item())
         total_count += images.size(0)
+        batch_acc = float((logits.argmax(dim=1) == targets).float().mean().item())
+        progress.set_postfix(loss=f"{float(loss.item()):.4f}", acc=f"{batch_acc:.3f}")
     return total_loss / max(1, total_count), total_correct / max(1, total_count)
 
 
@@ -87,8 +91,12 @@ def main() -> None:
     best_val = float("inf")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
-        val_loss, val_acc = run_epoch(model, val_loader, criterion, optimizer, device, train=False)
+        train_loss, train_acc = run_epoch(
+            model, train_loader, criterion, optimizer, device, True, f"epoch {epoch:03d}/{args.epochs} train"
+        )
+        val_loss, val_acc = run_epoch(
+            model, val_loader, criterion, optimizer, device, False, f"epoch {epoch:03d}/{args.epochs} val"
+        )
         print(
             f"epoch={epoch:03d} train_loss={train_loss:.5f} train_acc={train_acc:.3f} "
             f"val_loss={val_loss:.5f} val_acc={val_acc:.3f}"

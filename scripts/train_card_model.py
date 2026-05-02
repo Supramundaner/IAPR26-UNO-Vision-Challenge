@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -21,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--image-size", type=int, default=384)
+    parser.add_argument("--image-size", default="384", help="Square resize size, or 'original'")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--empty-loss-weight", type=float, default=0.25)
@@ -42,13 +43,15 @@ def run_epoch(
     device: torch.device,
     train: bool,
     empty_loss_weight: float,
+    desc: str,
 ) -> tuple[float, float, float]:
     model.train(train)
     total_loss = 0.0
     total_card_loss = 0.0
     total_empty_loss = 0.0
     total_count = 0
-    for images, conditions, card_targets, empty_targets, empty_masks in loader:
+    progress = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    for images, conditions, card_targets, empty_targets, empty_masks in progress:
         images = images.to(device)
         conditions = conditions.to(device)
         card_targets = card_targets.to(device)
@@ -68,6 +71,11 @@ def run_epoch(
         total_card_loss += float(card_loss.item()) * images.size(0)
         total_empty_loss += float(empty_loss.item()) * images.size(0)
         total_count += images.size(0)
+        progress.set_postfix(
+            loss=f"{float(loss.item()):.4f}",
+            card=f"{float(card_loss.item()):.4f}",
+            empty=f"{float(empty_loss.item()):.4f}",
+        )
     denominator = max(1, total_count)
     return total_loss / denominator, total_card_loss / denominator, total_empty_loss / denominator
 
@@ -114,10 +122,26 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for epoch in range(1, args.epochs + 1):
         train_loss, train_card_loss, train_empty_loss = run_epoch(
-            model, train_loader, card_criterion, empty_criterion, optimizer, device, True, args.empty_loss_weight
+            model,
+            train_loader,
+            card_criterion,
+            empty_criterion,
+            optimizer,
+            device,
+            True,
+            args.empty_loss_weight,
+            f"epoch {epoch:03d}/{args.epochs} train",
         )
         val_loss, val_card_loss, val_empty_loss = run_epoch(
-            model, val_loader, card_criterion, empty_criterion, optimizer, device, False, args.empty_loss_weight
+            model,
+            val_loader,
+            card_criterion,
+            empty_criterion,
+            optimizer,
+            device,
+            False,
+            args.empty_loss_weight,
+            f"epoch {epoch:03d}/{args.epochs} val",
         )
         print(
             f"epoch={epoch:03d} train_loss={train_loss:.5f} train_card={train_card_loss:.5f} "

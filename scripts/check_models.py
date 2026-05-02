@@ -15,7 +15,7 @@ from uno_vision.models import ActivePlayerCNN, ConditionalCardCNN, count_paramet
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--image-size", type=int, default=384)
+    parser.add_argument("--image-size", default="384")
     return parser.parse_args()
 
 
@@ -36,7 +36,8 @@ def main() -> None:
     if active_params >= PARAMETER_LIMIT:
         raise SystemExit(f"ActivePlayerCNN exceeds {PARAMETER_LIMIT:,} parameters")
 
-    batch = torch.randn(2, 3, args.image_size, args.image_size)
+    image_size = 128 if args.image_size == "original" else int(args.image_size)
+    batch = torch.randn(2, 3, image_size, image_size)
     conditions = torch.tensor([0, 1], dtype=torch.long)
     with torch.no_grad():
         card_logits, empty_logits = card_model(batch, conditions)

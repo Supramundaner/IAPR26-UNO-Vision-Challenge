@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-submission", type=Path, default=RAW_DATA_DIR / "sample_submission.csv")
     parser.add_argument("--image-dir", type=Path, default=RAW_DATA_DIR / "test_images")
     parser.add_argument("--output", type=Path, default=SUBMISSION_DIR / "submission.csv")
-    parser.add_argument("--image-size", type=int, default=384)
+    parser.add_argument("--image-size", default="384", help="Square resize size, or 'original'")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--empty-threshold", type=float, default=0.5)

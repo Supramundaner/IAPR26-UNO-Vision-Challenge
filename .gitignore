@@ -6,6 +6,7 @@ submissions/
 models/
 checkpoints/
 runs/
+wandb/
 
 # Python
 __pycache__/

@@ -14,17 +14,30 @@ from uno_vision.config import CONDITION_TO_INDEX, PLAYER_TO_CONDITION, PLAYER_TO
 from uno_vision.labels import LabelEncoder
 
 
-def image_transform(image_size: int, train: bool) -> transforms.Compose:
-    steps = [
-        transforms.Resize((image_size, image_size)),
-    ]
+ImageSize = int | str
+
+
+def normalize_image_size(image_size: ImageSize) -> int | None:
+    if isinstance(image_size, str):
+        if image_size.lower() == "original":
+            return None
+        return int(image_size)
+    return image_size
+
+
+def image_transform(image_size: ImageSize, train: bool) -> transforms.Compose:
+    normalized_size = normalize_image_size(image_size)
+    steps = []
+    if normalized_size is not None:
+        steps.append(transforms.Resize((normalized_size, normalized_size)))
     if train:
         steps.extend(
             [
                 transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.10, hue=0.02),
-                transforms.RandomAffine(degrees=4, translate=(0.02, 0.02), scale=(0.96, 1.04)),
             ]
         )
+        if normalized_size is not None:
+            steps.append(transforms.RandomAffine(degrees=4, translate=(0.02, 0.02), scale=(0.96, 1.04)))
     steps.extend(
         [
             transforms.ToTensor(),
@@ -65,7 +78,7 @@ class ConditionalCardDataset(Dataset):
         image_dir: Path,
         encoder: LabelEncoder,
         image_ids: set[str] | None = None,
-        image_size: int = 384,
+        image_size: ImageSize = 384,
         train: bool = True,
     ) -> None:
         self.df = pd.read_csv(train_csv)
@@ -113,7 +126,7 @@ class ActivePlayerDataset(Dataset):
         train_csv: Path,
         image_dir: Path,
         image_ids: set[str] | None = None,
-        image_size: int = 384,
+        image_size: ImageSize = 384,
         train: bool = True,
     ) -> None:
         self.df = pd.read_csv(train_csv)
@@ -133,7 +146,7 @@ class ActivePlayerDataset(Dataset):
 
 
 class TestImageDataset(Dataset):
-    def __init__(self, image_dir: Path, image_ids: list[str], image_size: int = 384) -> None:
+    def __init__(self, image_dir: Path, image_ids: list[str], image_size: ImageSize = 384) -> None:
         self.image_dir = image_dir
         self.image_ids = image_ids
         self.transform = image_transform(image_size, train=False)
