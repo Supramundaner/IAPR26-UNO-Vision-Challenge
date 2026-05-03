@@ -105,19 +105,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--black-rgb-tolerance",
         type=int,
-        default=42,
+        default=34,
         help="Per-channel RGB tolerance around the target black card color.",
     )
     parser.add_argument(
         "--max-black-rgb",
         type=int,
-        default=105,
+        default=88,
         help="Maximum RGB channel value for neutral dark black-card pixels.",
     )
     parser.add_argument(
         "--max-black-channel-spread",
         type=int,
-        default=38,
+        default=28,
         help="Maximum max(R,G,B)-min(R,G,B) spread for neutral dark black-card pixels.",
     )
     parser.add_argument(
@@ -147,14 +147,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-black-value",
         type=int,
-        default=105,
+        default=92,
         help="Maximum HSV value for black wild-card pixels.",
     )
     parser.add_argument(
         "--max-black-saturation",
         type=int,
-        default=95,
+        default=85,
         help="Maximum HSV saturation for black wild-card pixels.",
+    )
+    parser.add_argument(
+        "--min-black-area-frac",
+        type=float,
+        default=0.00022,
+        help="Reject black components smaller than this image-area fraction.",
     )
     parser.add_argument(
         "--component-mode",
@@ -348,8 +354,6 @@ def build_color_masks(
     s = hsv[:, :, 1]
     v = hsv[:, :, 2]
     b, g, r = cv2.split(image_bgr)
-    max_channel = np.maximum.reduce([r, g, b])
-    min_channel = np.minimum.reduce([r, g, b])
 
     color_gate = (s >= min_color_saturation) & (v >= min_color_value)
     masks = {}
@@ -361,12 +365,14 @@ def build_color_masks(
             & rgb_window(color, r, g, b, rgb_tol)
             & hue_window(color, h, hue_tol)
         )
+    max_channel = np.maximum.reduce([r, g, b])
+    min_channel = np.minimum.reduce([r, g, b])
     target_black = rgb_window("black", r, g, b, black_rgb_tolerance)
-    neutral_dark = (
+    tightly_neutral_black = (
         (max_channel <= max_black_rgb)
         & ((max_channel.astype(np.int16) - min_channel.astype(np.int16)) <= max_black_channel_spread)
     )
-    masks["black"] = (target_black | neutral_dark) & (v <= max_black_value) & (
+    masks["black"] = target_black & tightly_neutral_black & (v <= max_black_value) & (
         s <= max_black_saturation
     )
 
@@ -393,6 +399,7 @@ def filter_components(
     min_dark_support: float,
     min_fill_ratio: float,
     satellite_padding_frac: float,
+    min_black_area_frac: float,
 ) -> tuple[dict[str, np.ndarray], list[ComponentStats]]:
     if component_mode == "raw":
         return color_masks, []
@@ -400,6 +407,7 @@ def filter_components(
     height, width = white_support_mask.shape
     image_area = height * width
     min_area = max(90, int(image_area * 0.000018))
+    min_black_area = max(min_area, int(image_area * min_black_area_frac))
     output_masks: dict[str, np.ndarray] = {}
     rows: list[ComponentStats] = []
 
@@ -449,7 +457,10 @@ def filter_components(
 
             kept = True
             reason = "kept"
-            if area < min_area:
+            if color == "black" and area < min_black_area:
+                kept = False
+                reason = "black_too_small"
+            elif area < min_area:
                 kept = False
                 reason = "too_small"
             elif area > max_area:
@@ -837,6 +848,7 @@ def process_image(image_path: Path, args: argparse.Namespace) -> None:
         min_dark_support=args.min_dark_support,
         min_fill_ratio=args.min_fill_ratio,
         satellite_padding_frac=args.satellite_padding_frac,
+        min_black_area_frac=args.min_black_area_frac,
     )
     label_mask = combine_masks(filtered_masks)
 

@@ -45,15 +45,15 @@ Useful threshold options:
 ```powershell
 --rgb-tolerance 64
 --blue-rgb-tolerance 92
---black-rgb-tolerance 54
---max-black-rgb 132
---max-black-channel-spread 58
+--black-rgb-tolerance 34
+--max-black-rgb 88
+--max-black-channel-spread 28
 --hue-tolerance 10
 --blue-hue-tolerance 16
 --min-color-saturation 100
 --min-color-value 85
---max-black-value 110
---max-black-saturation 115
+--max-black-value 92
+--max-black-saturation 85
 --morph-kernel 3
 --hole-close-kernel 7
 ```
