@@ -6,8 +6,6 @@ The method first uses target RGB/HSV thresholds for red, yellow, blue, green, an
 
 After a main card-face component is kept, small same-color components inside or very near that component's bounding box are also kept as satellites. This preserves card numbers and symbols that are separated from the main colored region by the white oval.
 
-The final filtered mask is also converted into rough card bounding boxes. The bbox stage first extracts candidates separately per color class, then merges candidate boxes only when they overlap or contain each other. This avoids global all-color mask fusion while still connecting same-card fragments such as wild-card black regions, colored quadrants, and printed digits.
-
 ## Target Colors
 
 ```text
@@ -44,18 +42,23 @@ Useful threshold options:
 
 ```powershell
 --rgb-tolerance 64
---blue-rgb-tolerance 92
+--blue-rgb-tolerance 110
+--yellow-rgb-tolerance 88
 --black-rgb-tolerance 34
 --max-black-rgb 88
 --max-black-channel-spread 28
 --hue-tolerance 10
---blue-hue-tolerance 16
+--blue-hue-tolerance 22
+--yellow-hue-tolerance 16
 --min-color-saturation 100
 --min-color-value 85
 --max-black-value 92
 --max-black-saturation 85
 --morph-kernel 3
 --hole-close-kernel 7
+--post-min-region-area 1500
+--post-dilate-kernel 5
+--post-dilate-iterations 1
 ```
 
 Useful component-filter options:
@@ -70,17 +73,6 @@ Useful component-filter options:
 --satellite-padding-frac 0.08
 ```
 
-Useful bbox options:
-
-```powershell
---bbox-close-kernel 95
---bbox-dilate-kernel 21
---min-box-area-frac 0.00045
---max-box-area-frac 0.04
---max-box-aspect-ratio 4.0
---box-merge-overlap-frac 0.18
-```
-
 `raw` keeps every thresholded pixel and is useful for debugging the color thresholds. `card_like` is the default and removes many background or token components.
 
 ## Outputs
@@ -88,9 +80,6 @@ Useful bbox options:
 For each image, the script writes:
 
 - `<image_id>_raw_mask.png`: RGB/HSV threshold result before component filtering.
-- `<image_id>_mask.png`: filtered card-like segmentation mask.
-- `<image_id>_overlay.jpg`: mask overlaid on the original image.
+- `<image_id>_mask.png`: filtered card-like segmentation mask after small-region removal and dilation.
+- `<image_id>_overlay.jpg`: postprocessed mask overlaid on the original image.
 - `<image_id>_components.csv`: component statistics and keep/drop reasons. `kept_satellite` means a small number/symbol component was recovered because it lies inside or near a kept card-face component.
-- `<image_id>_card_boxes.csv`: rough bounding boxes extracted from per-color candidates; merged boxes have color values like `black+blue+green+red+yellow`.
-- `<image_id>_card_boxes.jpg`: original image with bounding boxes drawn.
-- `<image_id>_bbox_merge_mask.png`: intermediate mask used for bbox connected components.

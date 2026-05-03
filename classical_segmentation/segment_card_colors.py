@@ -54,20 +54,6 @@ class ComponentStats:
     color_support: float
 
 
-@dataclass(frozen=True)
-class CardBox:
-    image_id: str
-    box_id: int
-    color: str
-    x: int
-    y: int
-    width: int
-    height: int
-    area: int
-    fill_ratio: float
-    aspect_ratio: float
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Segment UNO card regions using target RGB/HSV and card-like components."
@@ -99,8 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--blue-rgb-tolerance",
         type=int,
-        default=92,
+        default=110,
         help="Per-channel RGB tolerance around the target blue card color.",
+    )
+    parser.add_argument(
+        "--yellow-rgb-tolerance",
+        type=int,
+        default=88,
+        help="Per-channel RGB tolerance around the target yellow card color.",
     )
     parser.add_argument(
         "--black-rgb-tolerance",
@@ -129,8 +121,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--blue-hue-tolerance",
         type=int,
-        default=16,
+        default=22,
         help="OpenCV hue tolerance around the target blue card color.",
+    )
+    parser.add_argument(
+        "--yellow-hue-tolerance",
+        type=int,
+        default=16,
+        help="OpenCV hue tolerance around the target yellow card color.",
     )
     parser.add_argument(
         "--min-color-saturation",
@@ -217,6 +215,24 @@ def parse_args() -> argparse.Namespace:
         help="Odd kernel size for filling small bright gaps inside thresholded card areas. Use 0 to disable.",
     )
     parser.add_argument(
+        "--post-min-region-area",
+        type=int,
+        default=5500,
+        help="Remove final same-color connected regions smaller than this many pixels. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--post-dilate-kernel",
+        type=int,
+        default=10,
+        help="Odd kernel size for final same-color dilation after small-region removal. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--post-dilate-iterations",
+        type=int,
+        default=1,
+        help="Number of final dilation iterations after small-region removal. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--satellite-padding-frac",
         type=float,
         default=0.08,
@@ -227,42 +243,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.55,
         help="Mask opacity in overlay images.",
-    )
-    parser.add_argument(
-        "--bbox-close-kernel",
-        type=int,
-        default=95,
-        help="Odd kernel size used to merge same-card mask fragments before bbox extraction.",
-    )
-    parser.add_argument(
-        "--bbox-dilate-kernel",
-        type=int,
-        default=21,
-        help="Odd kernel size used to slightly expand merged card regions before bbox extraction.",
-    )
-    parser.add_argument(
-        "--min-box-area-frac",
-        type=float,
-        default=0.00045,
-        help="Reject candidate boxes smaller than this image-area fraction.",
-    )
-    parser.add_argument(
-        "--max-box-area-frac",
-        type=float,
-        default=0.04,
-        help="Reject candidate boxes larger than this image-area fraction.",
-    )
-    parser.add_argument(
-        "--max-box-aspect-ratio",
-        type=float,
-        default=4.0,
-        help="Reject candidate boxes with max(width/height, height/width) above this value.",
-    )
-    parser.add_argument(
-        "--box-merge-overlap-frac",
-        type=float,
-        default=0.18,
-        help="Merge candidate boxes when intersection covers this fraction of the smaller box.",
     )
     return parser.parse_args()
 
@@ -337,11 +317,13 @@ def build_color_masks(
     image_bgr: np.ndarray,
     rgb_tolerance: int,
     blue_rgb_tolerance: int,
+    yellow_rgb_tolerance: int,
     black_rgb_tolerance: int,
     max_black_rgb: int,
     max_black_channel_spread: int,
     hue_tolerance: int,
     blue_hue_tolerance: int,
+    yellow_hue_tolerance: int,
     min_color_saturation: int,
     min_color_value: int,
     max_black_value: int,
@@ -358,8 +340,15 @@ def build_color_masks(
     color_gate = (s >= min_color_saturation) & (v >= min_color_value)
     masks = {}
     for color in ("red", "yellow", "blue", "green"):
-        rgb_tol = blue_rgb_tolerance if color == "blue" else rgb_tolerance
-        hue_tol = blue_hue_tolerance if color == "blue" else hue_tolerance
+        if color == "blue":
+            rgb_tol = blue_rgb_tolerance
+            hue_tol = blue_hue_tolerance
+        elif color == "yellow":
+            rgb_tol = yellow_rgb_tolerance
+            hue_tol = yellow_hue_tolerance
+        else:
+            rgb_tol = rgb_tolerance
+            hue_tol = hue_tolerance
         masks[color] = (
             color_gate
             & rgb_window(color, r, g, b, rgb_tol)
@@ -557,6 +546,52 @@ def combine_masks(color_masks: dict[str, np.ndarray]) -> np.ndarray:
     return combined
 
 
+def odd_kernel(size: int) -> tuple[int, int] | None:
+    if size <= 1:
+        return None
+    kernel_size = size if size % 2 == 1 else size + 1
+    return (kernel_size, kernel_size)
+
+
+def remove_small_regions(mask: np.ndarray, min_area: int) -> np.ndarray:
+    if min_area <= 1:
+        return mask.copy()
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8
+    )
+    filtered = np.zeros_like(mask, dtype=bool)
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            filtered[labels == label] = True
+    return filtered
+
+
+def postprocess_masks(
+    color_masks: dict[str, np.ndarray],
+    min_region_area: int,
+    dilate_kernel: int,
+    dilate_iterations: int,
+) -> dict[str, np.ndarray]:
+    kernel_size = odd_kernel(dilate_kernel)
+    dilation_kernel = None
+    if kernel_size is not None and dilate_iterations > 0:
+        dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
+
+    output_masks: dict[str, np.ndarray] = {}
+    for color, mask in color_masks.items():
+        processed = remove_small_regions(mask, min_region_area)
+        if dilation_kernel is not None:
+            processed_u8 = processed.astype(np.uint8) * 255
+            processed_u8 = cv2.dilate(
+                processed_u8, dilation_kernel, iterations=dilate_iterations
+            )
+            processed = processed_u8 > 0
+        output_masks[color] = processed
+    return output_masks
+
+
 def colorize_mask(label_mask: np.ndarray) -> np.ndarray:
     colorized = np.zeros((*label_mask.shape, 3), dtype=np.uint8)
     for index, color in enumerate(CARD_COLORS_BGR, start=1):
@@ -583,234 +618,6 @@ def save_component_csv(path: Path, rows: list[ComponentStats]) -> None:
             writer.writerow(row.__dict__)
 
 
-def odd_kernel(size: int) -> tuple[int, int] | None:
-    if size <= 1:
-        return None
-    kernel_size = size if size % 2 == 1 else size + 1
-    return (kernel_size, kernel_size)
-
-
-def extract_card_boxes(
-    image_id: str,
-    color_masks: dict[str, np.ndarray],
-    close_kernel: int,
-    dilate_kernel: int,
-    min_box_area_frac: float,
-    max_box_area_frac: float,
-    max_box_aspect_ratio: float,
-    box_merge_overlap_frac: float,
-) -> tuple[list[CardBox], np.ndarray]:
-    close_size = odd_kernel(close_kernel)
-    close_morph = None
-    if close_size is not None:
-        close_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, close_size)
-
-    dilate_size = odd_kernel(dilate_kernel)
-    dilate_morph = None
-    if dilate_size is not None:
-        dilate_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, dilate_size)
-
-    first_mask = next(iter(color_masks.values()))
-    height, width = first_mask.shape
-    merged_debug = np.zeros((height, width), dtype=np.uint8)
-    image_area = height * width
-    min_area = int(image_area * min_box_area_frac)
-    max_area = int(image_area * max_box_area_frac)
-
-    candidate_boxes: list[CardBox] = []
-    for color, mask in color_masks.items():
-        merged = mask.astype(np.uint8) * 255
-        if close_morph is not None:
-            merged = cv2.morphologyEx(merged, cv2.MORPH_CLOSE, close_morph, iterations=1)
-        if dilate_morph is not None:
-            merged = cv2.dilate(merged, dilate_morph, iterations=1)
-        merged_debug[merged > 0] = 255
-
-        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
-            (merged > 0).astype(np.uint8), connectivity=8
-        )
-        for label in range(1, num_labels):
-            x, y, w, h, area = stats[label]
-            bbox_area = max(1, int(w * h))
-            fill_ratio = float(area / bbox_area)
-            aspect_ratio = float(max(w / max(h, 1), h / max(w, 1)))
-            if area < min_area:
-                continue
-            if area > max_area:
-                continue
-            if aspect_ratio > max_box_aspect_ratio:
-                continue
-            candidate_boxes.append(
-                CardBox(
-                    image_id=image_id,
-                    box_id=len(candidate_boxes) + 1,
-                    color=color,
-                    x=int(x),
-                    y=int(y),
-                    width=int(w),
-                    height=int(h),
-                    area=int(area),
-                    fill_ratio=fill_ratio,
-                    aspect_ratio=aspect_ratio,
-                )
-            )
-
-    boxes = merge_related_boxes(candidate_boxes, image_id, box_merge_overlap_frac)
-    boxes = suppress_inner_boxes(boxes)
-    boxes.sort(key=lambda box: (box.y, box.x))
-    boxes = [
-        CardBox(
-            image_id=box.image_id,
-            box_id=index,
-            color=box.color,
-            x=box.x,
-            y=box.y,
-            width=box.width,
-            height=box.height,
-            area=box.area,
-            fill_ratio=box.fill_ratio,
-            aspect_ratio=box.aspect_ratio,
-        )
-        for index, box in enumerate(boxes, start=1)
-    ]
-    return boxes, merged_debug
-
-
-def merge_related_boxes(
-    boxes: list[CardBox], image_id: str, overlap_frac: float
-) -> list[CardBox]:
-    if not boxes:
-        return []
-
-    parent = list(range(len(boxes)))
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-
-    for i, left in enumerate(boxes):
-        for j in range(i + 1, len(boxes)):
-            right = boxes[j]
-            if should_merge_boxes(left, right, overlap_frac):
-                union(i, j)
-
-    groups: dict[int, list[CardBox]] = {}
-    for index, box in enumerate(boxes):
-        groups.setdefault(find(index), []).append(box)
-
-    merged: list[CardBox] = []
-    for group in groups.values():
-        x0 = min(box.x for box in group)
-        y0 = min(box.y for box in group)
-        x1 = max(box.x + box.width for box in group)
-        y1 = max(box.y + box.height for box in group)
-        area = sum(box.area for box in group)
-        width = x1 - x0
-        height = y1 - y0
-        bbox_area = max(1, width * height)
-        colors = "+".join(sorted({box.color for box in group}))
-        merged.append(
-            CardBox(
-                image_id=image_id,
-                box_id=len(merged) + 1,
-                color=colors,
-                x=x0,
-                y=y0,
-                width=width,
-                height=height,
-                area=area,
-                fill_ratio=float(area / bbox_area),
-                aspect_ratio=float(max(width / max(height, 1), height / max(width, 1))),
-            )
-        )
-    return merged
-
-
-def should_merge_boxes(left: CardBox, right: CardBox, overlap_frac: float) -> bool:
-    intersection = box_intersection_area(left, right)
-    if intersection <= 0:
-        return False
-
-    left_area = left.width * left.height
-    right_area = right.width * right.height
-    smaller_area = max(1, min(left_area, right_area))
-    if intersection / smaller_area >= overlap_frac:
-        return True
-
-    return box_center_inside(left, right) or box_center_inside(right, left)
-
-
-def box_intersection_area(left: CardBox, right: CardBox) -> int:
-    x0 = max(left.x, right.x)
-    y0 = max(left.y, right.y)
-    x1 = min(left.x + left.width, right.x + right.width)
-    y1 = min(left.y + left.height, right.y + right.height)
-    return max(0, x1 - x0) * max(0, y1 - y0)
-
-
-def box_center_inside(inner: CardBox, outer: CardBox) -> bool:
-    cx = inner.x + inner.width / 2.0
-    cy = inner.y + inner.height / 2.0
-    return outer.x <= cx <= outer.x + outer.width and outer.y <= cy <= outer.y + outer.height
-
-
-def suppress_inner_boxes(boxes: list[CardBox]) -> list[CardBox]:
-    kept: list[CardBox] = []
-    for index, box in enumerate(boxes):
-        box_area = box.width * box.height
-        cx = box.x + box.width / 2.0
-        cy = box.y + box.height / 2.0
-        inside_larger = False
-        for other_index, other in enumerate(boxes):
-            if index == other_index:
-                continue
-            other_area = other.width * other.height
-            if other_area <= box_area * 1.8:
-                continue
-            if other.x <= cx <= other.x + other.width and other.y <= cy <= other.y + other.height:
-                inside_larger = True
-                break
-        if not inside_larger:
-            kept.append(box)
-    return kept
-
-
-def draw_card_boxes(image_bgr: np.ndarray, boxes: list[CardBox]) -> np.ndarray:
-    output = image_bgr.copy()
-    for box in boxes:
-        p1 = (box.x, box.y)
-        p2 = (box.x + box.width, box.y + box.height)
-        cv2.rectangle(output, p1, p2, (0, 255, 255), 4)
-        cv2.putText(
-            output,
-            f"{box.box_id}:{box.color[0]}",
-            (box.x, max(0, box.y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.1,
-            (0, 255, 255),
-            3,
-            cv2.LINE_AA,
-        )
-    return output
-
-
-def save_boxes_csv(path: Path, boxes: list[CardBox]) -> None:
-    fieldnames = list(CardBox.__dataclass_fields__.keys())
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for box in boxes:
-            writer.writerow(box.__dict__)
-
-
 def process_image(image_path: Path, args: argparse.Namespace) -> None:
     image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
@@ -821,11 +628,13 @@ def process_image(image_path: Path, args: argparse.Namespace) -> None:
         image_bgr=image_bgr,
         rgb_tolerance=args.rgb_tolerance,
         blue_rgb_tolerance=args.blue_rgb_tolerance,
+        yellow_rgb_tolerance=args.yellow_rgb_tolerance,
         black_rgb_tolerance=args.black_rgb_tolerance,
         max_black_rgb=args.max_black_rgb,
         max_black_channel_spread=args.max_black_channel_spread,
         hue_tolerance=args.hue_tolerance,
         blue_hue_tolerance=args.blue_hue_tolerance,
+        yellow_hue_tolerance=args.yellow_hue_tolerance,
         min_color_saturation=args.min_color_saturation,
         min_color_value=args.min_color_value,
         max_black_value=args.max_black_value,
@@ -850,6 +659,12 @@ def process_image(image_path: Path, args: argparse.Namespace) -> None:
         satellite_padding_frac=args.satellite_padding_frac,
         min_black_area_frac=args.min_black_area_frac,
     )
+    filtered_masks = postprocess_masks(
+        color_masks=filtered_masks,
+        min_region_area=args.post_min_region_area,
+        dilate_kernel=args.post_dilate_kernel,
+        dilate_iterations=args.post_dilate_iterations,
+    )
     label_mask = combine_masks(filtered_masks)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -861,29 +676,12 @@ def process_image(image_path: Path, args: argparse.Namespace) -> None:
         [int(cv2.IMWRITE_JPEG_QUALITY), 92],
     )
     save_component_csv(args.output_dir / f"{image_id}_components.csv", component_rows)
-    boxes, bbox_merge_mask = extract_card_boxes(
-        image_id=image_id,
-        color_masks=filtered_masks,
-        close_kernel=args.bbox_close_kernel,
-        dilate_kernel=args.bbox_dilate_kernel,
-        min_box_area_frac=args.min_box_area_frac,
-        max_box_area_frac=args.max_box_area_frac,
-        max_box_aspect_ratio=args.max_box_aspect_ratio,
-        box_merge_overlap_frac=args.box_merge_overlap_frac,
-    )
-    save_boxes_csv(args.output_dir / f"{image_id}_card_boxes.csv", boxes)
-    cv2.imwrite(str(args.output_dir / f"{image_id}_bbox_merge_mask.png"), bbox_merge_mask)
-    cv2.imwrite(
-        str(args.output_dir / f"{image_id}_card_boxes.jpg"),
-        draw_card_boxes(image_bgr, boxes),
-        [int(cv2.IMWRITE_JPEG_QUALITY), 92],
-    )
 
     raw_pixels = int((raw_label_mask > 0).sum())
     filtered_pixels = int((label_mask > 0).sum())
     print(
-        f"{image_id}: raw_pixels={raw_pixels} filtered_pixels={filtered_pixels} "
-        f"boxes={len(boxes)} -> {args.output_dir}"
+        f"{image_id}: raw_pixels={raw_pixels} "
+        f"filtered_pixels={filtered_pixels} -> {args.output_dir}"
     )
 
 
