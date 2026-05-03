@@ -51,6 +51,21 @@ class ComponentStats:
     white_support: float
     inner_white_support: float
     dark_support: float
+    color_support: float
+
+
+@dataclass(frozen=True)
+class CardBox:
+    image_id: str
+    box_id: int
+    color: str
+    x: int
+    y: int
+    width: int
+    height: int
+    area: int
+    fill_ratio: float
+    aspect_ratio: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,16 +97,40 @@ def parse_args() -> argparse.Namespace:
         help="Per-channel RGB tolerance around the target non-black card colors.",
     )
     parser.add_argument(
+        "--blue-rgb-tolerance",
+        type=int,
+        default=92,
+        help="Per-channel RGB tolerance around the target blue card color.",
+    )
+    parser.add_argument(
         "--black-rgb-tolerance",
         type=int,
-        default=54,
+        default=42,
         help="Per-channel RGB tolerance around the target black card color.",
+    )
+    parser.add_argument(
+        "--max-black-rgb",
+        type=int,
+        default=105,
+        help="Maximum RGB channel value for neutral dark black-card pixels.",
+    )
+    parser.add_argument(
+        "--max-black-channel-spread",
+        type=int,
+        default=38,
+        help="Maximum max(R,G,B)-min(R,G,B) spread for neutral dark black-card pixels.",
     )
     parser.add_argument(
         "--hue-tolerance",
         type=int,
         default=10,
         help="OpenCV hue tolerance around the target non-black card colors.",
+    )
+    parser.add_argument(
+        "--blue-hue-tolerance",
+        type=int,
+        default=16,
+        help="OpenCV hue tolerance around the target blue card color.",
     )
     parser.add_argument(
         "--min-color-saturation",
@@ -108,13 +147,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-black-value",
         type=int,
-        default=110,
+        default=105,
         help="Maximum HSV value for black wild-card pixels.",
     )
     parser.add_argument(
         "--max-black-saturation",
         type=int,
-        default=115,
+        default=95,
         help="Maximum HSV saturation for black wild-card pixels.",
     )
     parser.add_argument(
@@ -166,10 +205,58 @@ def parse_args() -> argparse.Namespace:
         help="Odd kernel size for light morphological cleanup. Use 0 to disable.",
     )
     parser.add_argument(
+        "--hole-close-kernel",
+        type=int,
+        default=7,
+        help="Odd kernel size for filling small bright gaps inside thresholded card areas. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--satellite-padding-frac",
+        type=float,
+        default=0.08,
+        help="Extra bbox padding used to keep small number/symbol components near a kept card-face component.",
+    )
+    parser.add_argument(
         "--overlay-alpha",
         type=float,
         default=0.55,
         help="Mask opacity in overlay images.",
+    )
+    parser.add_argument(
+        "--bbox-close-kernel",
+        type=int,
+        default=95,
+        help="Odd kernel size used to merge same-card mask fragments before bbox extraction.",
+    )
+    parser.add_argument(
+        "--bbox-dilate-kernel",
+        type=int,
+        default=21,
+        help="Odd kernel size used to slightly expand merged card regions before bbox extraction.",
+    )
+    parser.add_argument(
+        "--min-box-area-frac",
+        type=float,
+        default=0.00045,
+        help="Reject candidate boxes smaller than this image-area fraction.",
+    )
+    parser.add_argument(
+        "--max-box-area-frac",
+        type=float,
+        default=0.04,
+        help="Reject candidate boxes larger than this image-area fraction.",
+    )
+    parser.add_argument(
+        "--max-box-aspect-ratio",
+        type=float,
+        default=4.0,
+        help="Reject candidate boxes with max(width/height, height/width) above this value.",
+    )
+    parser.add_argument(
+        "--box-merge-overlap-frac",
+        type=float,
+        default=0.18,
+        help="Merge candidate boxes when intersection covers this fraction of the smaller box.",
     )
     return parser.parse_args()
 
@@ -207,20 +294,35 @@ def hue_window(name: str, h: np.ndarray, tolerance: int) -> np.ndarray:
 
 
 def cleanup_masks(
-    masks: dict[str, np.ndarray], morph_kernel: int
+    masks: dict[str, np.ndarray], morph_kernel: int, hole_close_kernel: int
 ) -> dict[str, np.ndarray]:
-    if morph_kernel <= 1:
+    if morph_kernel <= 1 and hole_close_kernel <= 1:
         return masks
 
-    kernel_size = morph_kernel if morph_kernel % 2 == 1 else morph_kernel + 1
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
-    )
+    denoise_kernel = None
+    if morph_kernel > 1:
+        kernel_size = morph_kernel if morph_kernel % 2 == 1 else morph_kernel + 1
+        denoise_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+
+    hole_kernel = None
+    if hole_close_kernel > 1:
+        kernel_size = (
+            hole_close_kernel if hole_close_kernel % 2 == 1 else hole_close_kernel + 1
+        )
+        hole_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+
     cleaned = {}
     for color, mask in masks.items():
         mask_u8 = mask.astype(np.uint8) * 255
-        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
+        if denoise_kernel is not None:
+            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, denoise_kernel, iterations=1)
+            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, denoise_kernel, iterations=1)
+        if hole_kernel is not None:
+            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, hole_kernel, iterations=1)
         cleaned[color] = mask_u8 > 0
     return cleaned
 
@@ -228,39 +330,53 @@ def cleanup_masks(
 def build_color_masks(
     image_bgr: np.ndarray,
     rgb_tolerance: int,
+    blue_rgb_tolerance: int,
     black_rgb_tolerance: int,
+    max_black_rgb: int,
+    max_black_channel_spread: int,
     hue_tolerance: int,
+    blue_hue_tolerance: int,
     min_color_saturation: int,
     min_color_value: int,
     max_black_value: int,
     max_black_saturation: int,
     morph_kernel: int,
-) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    hole_close_kernel: int,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     h = hsv[:, :, 0]
     s = hsv[:, :, 1]
     v = hsv[:, :, 2]
     b, g, r = cv2.split(image_bgr)
+    max_channel = np.maximum.reduce([r, g, b])
+    min_channel = np.minimum.reduce([r, g, b])
 
     color_gate = (s >= min_color_saturation) & (v >= min_color_value)
-    masks = {
-        color: (
+    masks = {}
+    for color in ("red", "yellow", "blue", "green"):
+        rgb_tol = blue_rgb_tolerance if color == "blue" else rgb_tolerance
+        hue_tol = blue_hue_tolerance if color == "blue" else hue_tolerance
+        masks[color] = (
             color_gate
-            & rgb_window(color, r, g, b, rgb_tolerance)
-            & hue_window(color, h, hue_tolerance)
+            & rgb_window(color, r, g, b, rgb_tol)
+            & hue_window(color, h, hue_tol)
         )
-        for color in ("red", "yellow", "blue", "green")
-    }
-    masks["black"] = (
-        rgb_window("black", r, g, b, black_rgb_tolerance)
-        & (v <= max_black_value)
-        & (s <= max_black_saturation)
+    target_black = rgb_window("black", r, g, b, black_rgb_tolerance)
+    neutral_dark = (
+        (max_channel <= max_black_rgb)
+        & ((max_channel.astype(np.int16) - min_channel.astype(np.int16)) <= max_black_channel_spread)
+    )
+    masks["black"] = (target_black | neutral_dark) & (v <= max_black_value) & (
+        s <= max_black_saturation
     )
 
-    masks = cleanup_masks(masks, morph_kernel)
+    masks = cleanup_masks(masks, morph_kernel, hole_close_kernel)
+    color_support_mask = (
+        masks["red"] | masks["yellow"] | masks["blue"] | masks["green"]
+    )
     white_support_mask = (s <= 55) & (v >= 145) & (r >= 130) & (g >= 130) & (b >= 125)
     dark_support_mask = (v <= max_black_value) & (s <= max_black_saturation)
-    return masks, white_support_mask, dark_support_mask
+    return masks, white_support_mask, dark_support_mask, color_support_mask
 
 
 def filter_components(
@@ -268,6 +384,7 @@ def filter_components(
     color_masks: dict[str, np.ndarray],
     white_support_mask: np.ndarray,
     dark_support_mask: np.ndarray,
+    color_support_mask: np.ndarray,
     component_mode: str,
     max_component_area_frac: float,
     max_black_component_area_frac: float,
@@ -275,6 +392,7 @@ def filter_components(
     min_inner_white_support: float,
     min_dark_support: float,
     min_fill_ratio: float,
+    satellite_padding_frac: float,
 ) -> tuple[dict[str, np.ndarray], list[ComponentStats]]:
     if component_mode == "raw":
         return color_masks, []
@@ -299,6 +417,9 @@ def filter_components(
             )
         )
 
+        component_decisions = []
+        primary_bboxes = []
+
         for label in range(1, num_labels):
             x, y, w, h, area = component_stats[label]
             bbox_area = max(1, int(w * h))
@@ -313,11 +434,12 @@ def filter_components(
             white_support = float(white_support_mask[y0:y1, x0:x1].mean())
             inner_white_support = float(white_support_mask[y : y + h, x : x + w].mean())
             dark_support = float(dark_support_mask[y0:y1, x0:x1].mean())
+            color_support = float(color_support_mask[y0:y1, x0:x1].mean())
             small_wild_like = area <= int(image_area * 0.0030)
             if color == "black":
                 has_card_support = (
-                    white_support >= min_white_support
-                    and inner_white_support >= 0.02
+                    white_support >= max(min_white_support, 0.22)
+                    and inner_white_support >= 0.08
                     and fill_ratio <= 0.85
                 )
             else:
@@ -348,23 +470,67 @@ def filter_components(
 
             if kept:
                 filtered[labels == label] = True
+                primary_bboxes.append((x, y, w, h))
 
+            component_decisions.append(
+                {
+                    "label": label,
+                    "kept": kept,
+                    "reason": reason,
+                    "area": int(area),
+                    "bbox_x": int(x),
+                    "bbox_y": int(y),
+                    "bbox_w": int(w),
+                    "bbox_h": int(h),
+                    "fill_ratio": fill_ratio,
+                    "aspect_ratio": aspect_ratio,
+                    "white_support": white_support,
+                    "inner_white_support": inner_white_support,
+                    "dark_support": dark_support,
+                    "color_support": color_support,
+                }
+            )
+
+        for decision in component_decisions:
+            if decision["kept"]:
+                continue
+
+            x = decision["bbox_x"]
+            y = decision["bbox_y"]
+            w = decision["bbox_w"]
+            h = decision["bbox_h"]
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            satellite = False
+            for px, py, pw, ph in primary_bboxes:
+                pad = int(max(pw, ph) * satellite_padding_frac) + 4
+                if (px - pad) <= cx <= (px + pw + pad) and (py - pad) <= cy <= (py + ph + pad):
+                    satellite = True
+                    break
+
+            if satellite:
+                decision["kept"] = True
+                decision["reason"] = "kept_satellite"
+                filtered[labels == decision["label"]] = True
+
+        for decision in component_decisions:
             rows.append(
                 ComponentStats(
                     image_id=image_id,
                     color=color,
-                    kept=kept,
-                    reason=reason,
-                    area=int(area),
-                    bbox_x=int(x),
-                    bbox_y=int(y),
-                    bbox_w=int(w),
-                    bbox_h=int(h),
-                    fill_ratio=fill_ratio,
-                    aspect_ratio=aspect_ratio,
-                    white_support=white_support,
-                    inner_white_support=inner_white_support,
-                    dark_support=dark_support,
+                    kept=decision["kept"],
+                    reason=decision["reason"],
+                    area=decision["area"],
+                    bbox_x=decision["bbox_x"],
+                    bbox_y=decision["bbox_y"],
+                    bbox_w=decision["bbox_w"],
+                    bbox_h=decision["bbox_h"],
+                    fill_ratio=decision["fill_ratio"],
+                    aspect_ratio=decision["aspect_ratio"],
+                    white_support=decision["white_support"],
+                    inner_white_support=decision["inner_white_support"],
+                    dark_support=decision["dark_support"],
+                    color_support=decision["color_support"],
                 )
             )
 
@@ -406,22 +572,255 @@ def save_component_csv(path: Path, rows: list[ComponentStats]) -> None:
             writer.writerow(row.__dict__)
 
 
+def odd_kernel(size: int) -> tuple[int, int] | None:
+    if size <= 1:
+        return None
+    kernel_size = size if size % 2 == 1 else size + 1
+    return (kernel_size, kernel_size)
+
+
+def extract_card_boxes(
+    image_id: str,
+    color_masks: dict[str, np.ndarray],
+    close_kernel: int,
+    dilate_kernel: int,
+    min_box_area_frac: float,
+    max_box_area_frac: float,
+    max_box_aspect_ratio: float,
+    box_merge_overlap_frac: float,
+) -> tuple[list[CardBox], np.ndarray]:
+    close_size = odd_kernel(close_kernel)
+    close_morph = None
+    if close_size is not None:
+        close_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, close_size)
+
+    dilate_size = odd_kernel(dilate_kernel)
+    dilate_morph = None
+    if dilate_size is not None:
+        dilate_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, dilate_size)
+
+    first_mask = next(iter(color_masks.values()))
+    height, width = first_mask.shape
+    merged_debug = np.zeros((height, width), dtype=np.uint8)
+    image_area = height * width
+    min_area = int(image_area * min_box_area_frac)
+    max_area = int(image_area * max_box_area_frac)
+
+    candidate_boxes: list[CardBox] = []
+    for color, mask in color_masks.items():
+        merged = mask.astype(np.uint8) * 255
+        if close_morph is not None:
+            merged = cv2.morphologyEx(merged, cv2.MORPH_CLOSE, close_morph, iterations=1)
+        if dilate_morph is not None:
+            merged = cv2.dilate(merged, dilate_morph, iterations=1)
+        merged_debug[merged > 0] = 255
+
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+            (merged > 0).astype(np.uint8), connectivity=8
+        )
+        for label in range(1, num_labels):
+            x, y, w, h, area = stats[label]
+            bbox_area = max(1, int(w * h))
+            fill_ratio = float(area / bbox_area)
+            aspect_ratio = float(max(w / max(h, 1), h / max(w, 1)))
+            if area < min_area:
+                continue
+            if area > max_area:
+                continue
+            if aspect_ratio > max_box_aspect_ratio:
+                continue
+            candidate_boxes.append(
+                CardBox(
+                    image_id=image_id,
+                    box_id=len(candidate_boxes) + 1,
+                    color=color,
+                    x=int(x),
+                    y=int(y),
+                    width=int(w),
+                    height=int(h),
+                    area=int(area),
+                    fill_ratio=fill_ratio,
+                    aspect_ratio=aspect_ratio,
+                )
+            )
+
+    boxes = merge_related_boxes(candidate_boxes, image_id, box_merge_overlap_frac)
+    boxes = suppress_inner_boxes(boxes)
+    boxes.sort(key=lambda box: (box.y, box.x))
+    boxes = [
+        CardBox(
+            image_id=box.image_id,
+            box_id=index,
+            color=box.color,
+            x=box.x,
+            y=box.y,
+            width=box.width,
+            height=box.height,
+            area=box.area,
+            fill_ratio=box.fill_ratio,
+            aspect_ratio=box.aspect_ratio,
+        )
+        for index, box in enumerate(boxes, start=1)
+    ]
+    return boxes, merged_debug
+
+
+def merge_related_boxes(
+    boxes: list[CardBox], image_id: str, overlap_frac: float
+) -> list[CardBox]:
+    if not boxes:
+        return []
+
+    parent = list(range(len(boxes)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for i, left in enumerate(boxes):
+        for j in range(i + 1, len(boxes)):
+            right = boxes[j]
+            if should_merge_boxes(left, right, overlap_frac):
+                union(i, j)
+
+    groups: dict[int, list[CardBox]] = {}
+    for index, box in enumerate(boxes):
+        groups.setdefault(find(index), []).append(box)
+
+    merged: list[CardBox] = []
+    for group in groups.values():
+        x0 = min(box.x for box in group)
+        y0 = min(box.y for box in group)
+        x1 = max(box.x + box.width for box in group)
+        y1 = max(box.y + box.height for box in group)
+        area = sum(box.area for box in group)
+        width = x1 - x0
+        height = y1 - y0
+        bbox_area = max(1, width * height)
+        colors = "+".join(sorted({box.color for box in group}))
+        merged.append(
+            CardBox(
+                image_id=image_id,
+                box_id=len(merged) + 1,
+                color=colors,
+                x=x0,
+                y=y0,
+                width=width,
+                height=height,
+                area=area,
+                fill_ratio=float(area / bbox_area),
+                aspect_ratio=float(max(width / max(height, 1), height / max(width, 1))),
+            )
+        )
+    return merged
+
+
+def should_merge_boxes(left: CardBox, right: CardBox, overlap_frac: float) -> bool:
+    intersection = box_intersection_area(left, right)
+    if intersection <= 0:
+        return False
+
+    left_area = left.width * left.height
+    right_area = right.width * right.height
+    smaller_area = max(1, min(left_area, right_area))
+    if intersection / smaller_area >= overlap_frac:
+        return True
+
+    return box_center_inside(left, right) or box_center_inside(right, left)
+
+
+def box_intersection_area(left: CardBox, right: CardBox) -> int:
+    x0 = max(left.x, right.x)
+    y0 = max(left.y, right.y)
+    x1 = min(left.x + left.width, right.x + right.width)
+    y1 = min(left.y + left.height, right.y + right.height)
+    return max(0, x1 - x0) * max(0, y1 - y0)
+
+
+def box_center_inside(inner: CardBox, outer: CardBox) -> bool:
+    cx = inner.x + inner.width / 2.0
+    cy = inner.y + inner.height / 2.0
+    return outer.x <= cx <= outer.x + outer.width and outer.y <= cy <= outer.y + outer.height
+
+
+def suppress_inner_boxes(boxes: list[CardBox]) -> list[CardBox]:
+    kept: list[CardBox] = []
+    for index, box in enumerate(boxes):
+        box_area = box.width * box.height
+        cx = box.x + box.width / 2.0
+        cy = box.y + box.height / 2.0
+        inside_larger = False
+        for other_index, other in enumerate(boxes):
+            if index == other_index:
+                continue
+            other_area = other.width * other.height
+            if other_area <= box_area * 1.8:
+                continue
+            if other.x <= cx <= other.x + other.width and other.y <= cy <= other.y + other.height:
+                inside_larger = True
+                break
+        if not inside_larger:
+            kept.append(box)
+    return kept
+
+
+def draw_card_boxes(image_bgr: np.ndarray, boxes: list[CardBox]) -> np.ndarray:
+    output = image_bgr.copy()
+    for box in boxes:
+        p1 = (box.x, box.y)
+        p2 = (box.x + box.width, box.y + box.height)
+        cv2.rectangle(output, p1, p2, (0, 255, 255), 4)
+        cv2.putText(
+            output,
+            f"{box.box_id}:{box.color[0]}",
+            (box.x, max(0, box.y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.1,
+            (0, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+    return output
+
+
+def save_boxes_csv(path: Path, boxes: list[CardBox]) -> None:
+    fieldnames = list(CardBox.__dataclass_fields__.keys())
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for box in boxes:
+            writer.writerow(box.__dict__)
+
+
 def process_image(image_path: Path, args: argparse.Namespace) -> None:
     image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
         raise ValueError(f"Could not read image: {image_path}")
 
     image_id = image_path.stem
-    color_masks, white_support_mask, dark_support_mask = build_color_masks(
+    color_masks, white_support_mask, dark_support_mask, color_support_mask = build_color_masks(
         image_bgr=image_bgr,
         rgb_tolerance=args.rgb_tolerance,
+        blue_rgb_tolerance=args.blue_rgb_tolerance,
         black_rgb_tolerance=args.black_rgb_tolerance,
+        max_black_rgb=args.max_black_rgb,
+        max_black_channel_spread=args.max_black_channel_spread,
         hue_tolerance=args.hue_tolerance,
+        blue_hue_tolerance=args.blue_hue_tolerance,
         min_color_saturation=args.min_color_saturation,
         min_color_value=args.min_color_value,
         max_black_value=args.max_black_value,
         max_black_saturation=args.max_black_saturation,
         morph_kernel=args.morph_kernel,
+        hole_close_kernel=args.hole_close_kernel,
     )
     raw_label_mask = combine_masks(color_masks)
     filtered_masks, component_rows = filter_components(
@@ -429,6 +828,7 @@ def process_image(image_path: Path, args: argparse.Namespace) -> None:
         color_masks=color_masks,
         white_support_mask=white_support_mask,
         dark_support_mask=dark_support_mask,
+        color_support_mask=color_support_mask,
         component_mode=args.component_mode,
         max_component_area_frac=args.max_component_area_frac,
         max_black_component_area_frac=args.max_black_component_area_frac,
@@ -436,6 +836,7 @@ def process_image(image_path: Path, args: argparse.Namespace) -> None:
         min_inner_white_support=args.min_inner_white_support,
         min_dark_support=args.min_dark_support,
         min_fill_ratio=args.min_fill_ratio,
+        satellite_padding_frac=args.satellite_padding_frac,
     )
     label_mask = combine_masks(filtered_masks)
 
@@ -448,10 +849,30 @@ def process_image(image_path: Path, args: argparse.Namespace) -> None:
         [int(cv2.IMWRITE_JPEG_QUALITY), 92],
     )
     save_component_csv(args.output_dir / f"{image_id}_components.csv", component_rows)
+    boxes, bbox_merge_mask = extract_card_boxes(
+        image_id=image_id,
+        color_masks=filtered_masks,
+        close_kernel=args.bbox_close_kernel,
+        dilate_kernel=args.bbox_dilate_kernel,
+        min_box_area_frac=args.min_box_area_frac,
+        max_box_area_frac=args.max_box_area_frac,
+        max_box_aspect_ratio=args.max_box_aspect_ratio,
+        box_merge_overlap_frac=args.box_merge_overlap_frac,
+    )
+    save_boxes_csv(args.output_dir / f"{image_id}_card_boxes.csv", boxes)
+    cv2.imwrite(str(args.output_dir / f"{image_id}_bbox_merge_mask.png"), bbox_merge_mask)
+    cv2.imwrite(
+        str(args.output_dir / f"{image_id}_card_boxes.jpg"),
+        draw_card_boxes(image_bgr, boxes),
+        [int(cv2.IMWRITE_JPEG_QUALITY), 92],
+    )
 
     raw_pixels = int((raw_label_mask > 0).sum())
     filtered_pixels = int((label_mask > 0).sum())
-    print(f"{image_id}: raw_pixels={raw_pixels} filtered_pixels={filtered_pixels} -> {args.output_dir}")
+    print(
+        f"{image_id}: raw_pixels={raw_pixels} filtered_pixels={filtered_pixels} "
+        f"boxes={len(boxes)} -> {args.output_dir}"
+    )
 
 
 def main() -> None:
