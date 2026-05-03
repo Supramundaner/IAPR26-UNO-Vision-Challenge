@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -8,17 +10,52 @@ import numpy as np
 
 
 CARD_COLORS_BGR = {
-    "red": (45, 45, 235),
-    "yellow": (35, 215, 245),
-    "blue": (225, 150, 30),
-    "green": (80, 190, 75),
-    "black": (35, 35, 35),
+    "red": (51, 47, 229),
+    "yellow": (1, 200, 237),
+    "blue": (211, 154, 0),
+    "green": (65, 186, 97),
+    "black": (38, 44, 47),
 }
+
+TARGET_RGB = {
+    "black": (47, 44, 38),
+    "blue": (0, 154, 211),
+    "yellow": (237, 200, 1),
+    "red": (229, 47, 51),
+    "green": (97, 186, 65),
+}
+
+TARGET_HSV = {
+    # OpenCV HSV: hue is 0..179, saturation/value are 0..255.
+    "black": (20, 49, 47),
+    "blue": (98, 255, 211),
+    "yellow": (25, 254, 237),
+    "red": (179, 203, 229),
+    "green": (52, 166, 186),
+}
+
+
+@dataclass(frozen=True)
+class ComponentStats:
+    image_id: str
+    color: str
+    kept: bool
+    reason: str
+    area: int
+    bbox_x: int
+    bbox_y: int
+    bbox_w: int
+    bbox_h: int
+    fill_ratio: float
+    aspect_ratio: float
+    white_support: float
+    inner_white_support: float
+    dark_support: float
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Segment UNO card printed regions with strict RGB + HSV thresholds."
+        description="Segment UNO card regions using target RGB/HSV and card-like components."
     )
     parser.add_argument(
         "--input",
@@ -30,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default=Path("outputs/classical_segmentation"),
         type=Path,
-        help="Directory for masks and overlays.",
+        help="Directory for masks, overlays, and component CSV files.",
     )
     parser.add_argument(
         "--limit",
@@ -39,28 +76,88 @@ def parse_args() -> argparse.Namespace:
         help="Optional maximum number of images when --input is a directory.",
     )
     parser.add_argument(
-        "--min-saturation",
+        "--rgb-tolerance",
         type=int,
-        default=70,
+        default=64,
+        help="Per-channel RGB tolerance around the target non-black card colors.",
+    )
+    parser.add_argument(
+        "--black-rgb-tolerance",
+        type=int,
+        default=54,
+        help="Per-channel RGB tolerance around the target black card color.",
+    )
+    parser.add_argument(
+        "--hue-tolerance",
+        type=int,
+        default=10,
+        help="OpenCV hue tolerance around the target non-black card colors.",
+    )
+    parser.add_argument(
+        "--min-color-saturation",
+        type=int,
+        default=100,
         help="Minimum HSV saturation for red/yellow/blue/green card pixels.",
     )
     parser.add_argument(
-        "--min-value",
+        "--min-color-value",
         type=int,
-        default=90,
+        default=85,
         help="Minimum HSV value for red/yellow/blue/green card pixels.",
     )
     parser.add_argument(
         "--max-black-value",
         type=int,
-        default=95,
+        default=110,
         help="Maximum HSV value for black wild-card pixels.",
     )
     parser.add_argument(
         "--max-black-saturation",
         type=int,
-        default=120,
+        default=115,
         help="Maximum HSV saturation for black wild-card pixels.",
+    )
+    parser.add_argument(
+        "--component-mode",
+        choices=("card_like", "raw"),
+        default="card_like",
+        help="Whether to filter connected components or keep every thresholded pixel.",
+    )
+    parser.add_argument(
+        "--max-component-area-frac",
+        type=float,
+        default=0.0065,
+        help="Reject non-black components larger than this fraction of image area.",
+    )
+    parser.add_argument(
+        "--max-black-component-area-frac",
+        type=float,
+        default=0.012,
+        help="Reject black components larger than this fraction of image area.",
+    )
+    parser.add_argument(
+        "--min-white-support",
+        type=float,
+        default=0.18,
+        help="Minimum nearby white-card-pixel ratio for a component.",
+    )
+    parser.add_argument(
+        "--min-inner-white-support",
+        type=float,
+        default=0.30,
+        help="Minimum white-card-pixel ratio inside a normal color component bbox.",
+    )
+    parser.add_argument(
+        "--min-dark-support",
+        type=float,
+        default=0.08,
+        help="Minimum nearby dark-card-pixel ratio for small wild-card color components.",
+    )
+    parser.add_argument(
+        "--min-fill-ratio",
+        type=float,
+        default=0.18,
+        help="Minimum component area divided by its bounding box area.",
     )
     parser.add_argument(
         "--morph-kernel",
@@ -88,74 +185,30 @@ def iter_images(input_path: Path, limit: int | None) -> list[Path]:
     return images
 
 
-def build_color_masks(
-    image_bgr: np.ndarray,
-    min_saturation: int,
-    min_value: int,
-    max_black_value: int,
-    max_black_saturation: int,
-    morph_kernel: int,
-) -> dict[str, np.ndarray]:
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    h = hsv[:, :, 0]
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
-    b, g, r = cv2.split(image_bgr)
-
+def rgb_window(
+    name: str, r: np.ndarray, g: np.ndarray, b: np.ndarray, tolerance: int
+) -> np.ndarray:
+    target_r, target_g, target_b = TARGET_RGB[name]
     r16 = r.astype(np.int16)
     g16 = g.astype(np.int16)
     b16 = b.astype(np.int16)
-    saturated = (s >= min_saturation) & (v >= min_value)
-
-    red = (
-        saturated
-        & ((h <= 10) | (h >= 170))
-        & (r >= 145)
-        & ((r16 - g16) >= 35)
-        & ((r16 - b16) >= 35)
-    )
-    yellow = (
-        saturated
-        & (h >= 18)
-        & (h <= 40)
-        & (r >= 145)
-        & (g >= 125)
-        & (b <= 170)
-        & (np.abs(r16 - g16) <= 80)
-        & ((np.minimum(r16, g16) - b16) >= 30)
-    )
-    blue = (
-        saturated
-        & (h >= 88)
-        & (h <= 112)
-        & (b >= 105)
-        & ((b16 - r16) >= 30)
-        & ((g16 - r16) >= 5)
-    )
-    green = (
-        saturated
-        & (h >= 48)
-        & (h <= 82)
-        & (g >= 105)
-        & ((g16 - r16) >= 15)
-        & ((g16 - b16) >= 5)
-    )
-    black = (
-        (v <= max_black_value)
-        & (s <= max_black_saturation)
-        & (r <= 105)
-        & (g <= 105)
-        & (b <= 105)
+    return (
+        (np.abs(r16 - target_r) <= tolerance)
+        & (np.abs(g16 - target_g) <= tolerance)
+        & (np.abs(b16 - target_b) <= tolerance)
     )
 
-    masks = {
-        "red": red,
-        "yellow": yellow,
-        "blue": blue,
-        "green": green,
-        "black": black,
-    }
 
+def hue_window(name: str, h: np.ndarray, tolerance: int) -> np.ndarray:
+    target_h = TARGET_HSV[name][0]
+    hue_delta = np.abs(h.astype(np.int16) - target_h)
+    circular_delta = np.minimum(hue_delta, 180 - hue_delta)
+    return circular_delta <= tolerance
+
+
+def cleanup_masks(
+    masks: dict[str, np.ndarray], morph_kernel: int
+) -> dict[str, np.ndarray]:
     if morph_kernel <= 1:
         return masks
 
@@ -170,6 +223,154 @@ def build_color_masks(
         mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
         cleaned[color] = mask_u8 > 0
     return cleaned
+
+
+def build_color_masks(
+    image_bgr: np.ndarray,
+    rgb_tolerance: int,
+    black_rgb_tolerance: int,
+    hue_tolerance: int,
+    min_color_saturation: int,
+    min_color_value: int,
+    max_black_value: int,
+    max_black_saturation: int,
+    morph_kernel: int,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    b, g, r = cv2.split(image_bgr)
+
+    color_gate = (s >= min_color_saturation) & (v >= min_color_value)
+    masks = {
+        color: (
+            color_gate
+            & rgb_window(color, r, g, b, rgb_tolerance)
+            & hue_window(color, h, hue_tolerance)
+        )
+        for color in ("red", "yellow", "blue", "green")
+    }
+    masks["black"] = (
+        rgb_window("black", r, g, b, black_rgb_tolerance)
+        & (v <= max_black_value)
+        & (s <= max_black_saturation)
+    )
+
+    masks = cleanup_masks(masks, morph_kernel)
+    white_support_mask = (s <= 55) & (v >= 145) & (r >= 130) & (g >= 130) & (b >= 125)
+    dark_support_mask = (v <= max_black_value) & (s <= max_black_saturation)
+    return masks, white_support_mask, dark_support_mask
+
+
+def filter_components(
+    image_id: str,
+    color_masks: dict[str, np.ndarray],
+    white_support_mask: np.ndarray,
+    dark_support_mask: np.ndarray,
+    component_mode: str,
+    max_component_area_frac: float,
+    max_black_component_area_frac: float,
+    min_white_support: float,
+    min_inner_white_support: float,
+    min_dark_support: float,
+    min_fill_ratio: float,
+) -> tuple[dict[str, np.ndarray], list[ComponentStats]]:
+    if component_mode == "raw":
+        return color_masks, []
+
+    height, width = white_support_mask.shape
+    image_area = height * width
+    min_area = max(90, int(image_area * 0.000018))
+    output_masks: dict[str, np.ndarray] = {}
+    rows: list[ComponentStats] = []
+
+    for color, mask in color_masks.items():
+        num_labels, labels, component_stats, _ = cv2.connectedComponentsWithStats(
+            mask.astype(np.uint8), connectivity=8
+        )
+        filtered = np.zeros_like(mask, dtype=bool)
+        max_area = int(
+            image_area
+            * (
+                max_black_component_area_frac
+                if color == "black"
+                else max_component_area_frac
+            )
+        )
+
+        for label in range(1, num_labels):
+            x, y, w, h, area = component_stats[label]
+            bbox_area = max(1, int(w * h))
+            fill_ratio = float(area / bbox_area)
+            aspect_ratio = float(max(w / max(h, 1), h / max(w, 1)))
+
+            pad = int(max(w, h) * 0.35) + 6
+            x0 = max(0, x - pad)
+            y0 = max(0, y - pad)
+            x1 = min(width, x + w + pad)
+            y1 = min(height, y + h + pad)
+            white_support = float(white_support_mask[y0:y1, x0:x1].mean())
+            inner_white_support = float(white_support_mask[y : y + h, x : x + w].mean())
+            dark_support = float(dark_support_mask[y0:y1, x0:x1].mean())
+            small_wild_like = area <= int(image_area * 0.0030)
+            if color == "black":
+                has_card_support = (
+                    white_support >= min_white_support
+                    and inner_white_support >= 0.02
+                    and fill_ratio <= 0.85
+                )
+            else:
+                has_card_support = inner_white_support >= min_inner_white_support or (
+                    small_wild_like and dark_support >= min_dark_support
+                )
+
+            kept = True
+            reason = "kept"
+            if area < min_area:
+                kept = False
+                reason = "too_small"
+            elif area > max_area:
+                kept = False
+                reason = "too_large"
+            elif aspect_ratio > (3.0 if color == "black" else 2.25):
+                kept = False
+                reason = "too_thin"
+            elif fill_ratio < min_fill_ratio:
+                kept = False
+                reason = "too_sparse"
+            elif white_support < min_white_support:
+                kept = False
+                reason = "low_white_support"
+            elif not has_card_support:
+                kept = False
+                reason = "low_card_support"
+
+            if kept:
+                filtered[labels == label] = True
+
+            rows.append(
+                ComponentStats(
+                    image_id=image_id,
+                    color=color,
+                    kept=kept,
+                    reason=reason,
+                    area=int(area),
+                    bbox_x=int(x),
+                    bbox_y=int(y),
+                    bbox_w=int(w),
+                    bbox_h=int(h),
+                    fill_ratio=fill_ratio,
+                    aspect_ratio=aspect_ratio,
+                    white_support=white_support,
+                    inner_white_support=inner_white_support,
+                    dark_support=dark_support,
+                )
+            )
+
+        output_masks[color] = filtered
+
+    return output_masks, rows
 
 
 def combine_masks(color_masks: dict[str, np.ndarray]) -> np.ndarray:
@@ -196,41 +397,61 @@ def make_overlay(image_bgr: np.ndarray, label_mask: np.ndarray, alpha: float) ->
     return overlay
 
 
-def process_image(
-    image_path: Path,
-    output_dir: Path,
-    min_saturation: int,
-    min_value: int,
-    max_black_value: int,
-    max_black_saturation: int,
-    morph_kernel: int,
-    overlay_alpha: float,
-) -> None:
+def save_component_csv(path: Path, rows: list[ComponentStats]) -> None:
+    fieldnames = list(ComponentStats.__dataclass_fields__.keys())
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row.__dict__)
+
+
+def process_image(image_path: Path, args: argparse.Namespace) -> None:
     image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
         raise ValueError(f"Could not read image: {image_path}")
 
     image_id = image_path.stem
-    masks = build_color_masks(
+    color_masks, white_support_mask, dark_support_mask = build_color_masks(
         image_bgr=image_bgr,
-        min_saturation=min_saturation,
-        min_value=min_value,
-        max_black_value=max_black_value,
-        max_black_saturation=max_black_saturation,
-        morph_kernel=morph_kernel,
+        rgb_tolerance=args.rgb_tolerance,
+        black_rgb_tolerance=args.black_rgb_tolerance,
+        hue_tolerance=args.hue_tolerance,
+        min_color_saturation=args.min_color_saturation,
+        min_color_value=args.min_color_value,
+        max_black_value=args.max_black_value,
+        max_black_saturation=args.max_black_saturation,
+        morph_kernel=args.morph_kernel,
     )
-    label_mask = combine_masks(masks)
+    raw_label_mask = combine_masks(color_masks)
+    filtered_masks, component_rows = filter_components(
+        image_id=image_id,
+        color_masks=color_masks,
+        white_support_mask=white_support_mask,
+        dark_support_mask=dark_support_mask,
+        component_mode=args.component_mode,
+        max_component_area_frac=args.max_component_area_frac,
+        max_black_component_area_frac=args.max_black_component_area_frac,
+        min_white_support=args.min_white_support,
+        min_inner_white_support=args.min_inner_white_support,
+        min_dark_support=args.min_dark_support,
+        min_fill_ratio=args.min_fill_ratio,
+    )
+    label_mask = combine_masks(filtered_masks)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_dir / f"{image_id}_mask.png"), colorize_mask(label_mask))
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(args.output_dir / f"{image_id}_raw_mask.png"), colorize_mask(raw_label_mask))
+    cv2.imwrite(str(args.output_dir / f"{image_id}_mask.png"), colorize_mask(label_mask))
     cv2.imwrite(
-        str(output_dir / f"{image_id}_overlay.jpg"),
-        make_overlay(image_bgr, label_mask, overlay_alpha),
+        str(args.output_dir / f"{image_id}_overlay.jpg"),
+        make_overlay(image_bgr, label_mask, args.overlay_alpha),
         [int(cv2.IMWRITE_JPEG_QUALITY), 92],
     )
+    save_component_csv(args.output_dir / f"{image_id}_components.csv", component_rows)
 
-    pixel_counts = ", ".join(f"{name}={int(mask.sum())}" for name, mask in masks.items())
-    print(f"{image_id}: {pixel_counts} -> {output_dir}")
+    raw_pixels = int((raw_label_mask > 0).sum())
+    filtered_pixels = int((label_mask > 0).sum())
+    print(f"{image_id}: raw_pixels={raw_pixels} filtered_pixels={filtered_pixels} -> {args.output_dir}")
 
 
 def main() -> None:
@@ -240,16 +461,7 @@ def main() -> None:
         raise SystemExit(f"No images found in {args.input}")
 
     for image_path in images:
-        process_image(
-            image_path=image_path,
-            output_dir=args.output_dir,
-            min_saturation=args.min_saturation,
-            min_value=args.min_value,
-            max_black_value=args.max_black_value,
-            max_black_saturation=args.max_black_saturation,
-            morph_kernel=args.morph_kernel,
-            overlay_alpha=args.overlay_alpha,
-        )
+        process_image(image_path, args)
 
 
 if __name__ == "__main__":
